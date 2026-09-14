@@ -1,0 +1,8 @@
+version: 1
+name: missing-include
+include:
+  - ./not-exist.yaml
+steps:
+  - action: goto
+    name: x
+    url: /x

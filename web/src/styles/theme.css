@@ -1,0 +1,38 @@
+/**
+ * 对话式控制台 V2 主题：黑白灰极简（白底黑字，对齐 Codex 桌面端亮色调性）。
+ * 全局 CSS 变量——所有组件只用变量，不写死颜色。
+ */
+
+:root {
+  /* 底色层级（亮色系：白底黑字） */
+  --bg: #ffffff;            /* 最外层背景 */
+  --bg-sidebar: #f7f7f8;    /* 左侧栏（浅灰区分主区） */
+  --bg-panel: #f4f4f5;      /* 卡片/面板（灰卡浮在白底上，代替边框） */
+  --bg-elevated: #ececef;   /* 深一级灰（hover 强调） */
+  --bg-hover: #ededf0;      /* hover 态 */
+
+  /* 边框——只用于输入框和必要结构分隔线（hairline） */
+  --border: #e2e2e6;
+  --border-strong: #c9c9cf;
+  --hairline: #eeeef1;
+
+  /* 文字 */
+  --text: #1a1a1a;          /* 主文字（近黑） */
+  --text-dim: #5f5f66;      /* 次要文字 */
+  --text-faint: #9a9aa2;    /* 占位/禁用 */
+
+  /* 语义色（黑白灰里仅保留最小语义提示，压暗保证浅底可读） */
+  --accent: #1a1a1a;        /* 主按钮（黑底白字反转） */
+  --accent-text: #ffffff;
+  --ok: #2e7d43;
+  --warn: #9a7000;
+  --err: #b3392e;
+
+  /* 尺寸 */
+  --sidebar-w: 264px;
+  --radius: 8px;
+  --radius-sm: 6px;
+
+  /* 字体 */
+  --mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, monospace;
+}

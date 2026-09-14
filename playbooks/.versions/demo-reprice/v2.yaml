@@ -1,0 +1,58 @@
+# v2 — 沉淀自 Agent 兜底轨迹（步骤「填新价格」自愈路径沉淀（Agent 2 步）） runId=2026-09-09_17-18-34_demo-reprice-v1
+version: 1
+name: demo-reprice-v1
+description: W8 演示：改版场景改价（v1 旧选择器——保存按钮已改名"确认下单"，用于触发 A→B→A→C 闭环）
+vars:
+  adminHost: http://localhost:3456
+  __baseUrl: http://localhost:3456
+auth: localhost
+meta:
+  baseUrl: http://localhost:3456
+  allowDomains:
+    - localhost
+  sensitive:
+    - password
+steps:
+  - name: 打开登录页
+    action: goto
+    url: /login
+  - name: 填用户名
+    action: fill
+    selector:
+      css: '#username'
+    value: ${params.username}
+  - name: 填密码
+    action: fill
+    selector:
+      css: '#password'
+    value: ${env.DEMO_PASSWORD}
+  - name: 点登录
+    action: click
+    selector:
+      text: 登录
+  - name: 确认登录成功
+    action: assert
+    urlPattern: /dashboard
+  - name: 打开改版编辑页
+    action: goto
+    url: /sku/S050/edit?variant=b
+  - action: fill
+    name: 填值
+    selector:
+      css: '#price'
+    value: '199'
+  - action: click
+    name: 点击「确认下单」
+    selector:
+      css: button.btn-save-v2
+      text: 确认下单
+    dialog: accept
+  - name: 点保存
+    timeout: 5000
+    action: click
+    selector:
+      text: 保存
+  - name: 确认保存成功
+    timeout: 8000
+    action: assert
+    textContains: 保存成功

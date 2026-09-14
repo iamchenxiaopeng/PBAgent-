@@ -1,0 +1,21 @@
+version: 1
+name: demo-login
+description: 演示后台登录子流程（被 include 复用）
+steps:
+  - action: goto
+    name: 打开登录页
+    url: /login
+  - action: fill
+    name: 填用户名
+    selector: { css: '#username' }
+    value: '${params.username}'
+  - action: fill
+    name: 填密码
+    selector: { css: '#password' }
+    value: '${env.DEMO_PASSWORD}'
+  - action: click
+    name: 点登录
+    selector: { text: 登录 }
+  - action: assert
+    name: 确认登录成功
+    urlPattern: '/dashboard'

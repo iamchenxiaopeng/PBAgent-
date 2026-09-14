@@ -1,0 +1,29 @@
+version: 1
+name: demo-reprice-v1
+description: W8 演示：改版场景改价（v1 旧选择器——保存按钮已改名"确认下单"，用于触发 A→B→A→C 闭环）
+include:
+  - ../src/playbook/examples/_login.yaml
+auth: localhost
+vars:
+  adminHost: 'http://localhost:3456'
+meta:
+  baseUrl: ${vars.adminHost}
+  allowDomains:
+    - localhost
+  sensitive: [password]
+steps:
+  - action: goto
+    name: 打开改版编辑页
+    url: '/sku/S050/edit?variant=b'
+  - action: fill
+    name: 填新价格
+    selector: { css: '#price', text: 价格 }
+    value: '${params.price}'
+  - action: click
+    name: 点保存
+    selector: { text: 保存 }
+    timeout: 5000
+  - action: assert
+    name: 确认保存成功
+    textContains: 保存成功
+    timeout: 8000

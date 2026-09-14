@@ -1,0 +1,41 @@
+{
+  "name": "pbagent",
+  "version": "0.1.0",
+  "description": "Playbook + LLM hybrid browser automation agent",
+  "type": "module",
+  "bin": {
+    "pbagent": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/cli/index.ts",
+    "cli": "tsx src/cli/index.ts",
+    "server": "tsx src/server/index.ts",
+    "web": "cd web && ../node_modules/vite/bin/vite.js",
+    "web:server": "concurrently \"npm:server\" \"npm:web\" || (npm run server & cd web && ../node_modules/vite/bin/vite.js)"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "express": "^4.22.2",
+    "js-yaml": "^4.1.0",
+    "playwright": "1.47",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.5.0",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.21",
+    "vitest": "^2.0.5",
+    "vue": "^3.5.42"
+  }
+}

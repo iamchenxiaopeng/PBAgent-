@@ -1,0 +1,43 @@
+version: 1
+name: sku-reprice
+description: 演示后台批量改价：登录 → 进入 SKU 编辑页 → 改价 → 保存
+include:
+  - ./_login.yaml
+auth: localhost
+vars:
+  adminHost: 'https://admin.demo.internal'
+meta:
+  baseUrl: ${vars.adminHost}
+  allowDomains:
+    - admin.demo.internal
+  sensitive: [password]
+steps:
+  - action: goto
+    name: 打开 SKU 列表
+    url: /sku/list
+  - action: loop
+    name: 逐个改价
+    over: ${params.items}
+    var: item
+    steps:
+      - action: goto
+        name: 进入 SKU 编辑页
+        url: '/sku/${item.id}/edit'
+      - action: fill
+        name: 填新价格
+        selector: { css: '#price', text: 价格 }
+        value: '${item.price}'
+      - action: click
+        name: 点保存
+        selector: { text: 保存 }
+      - action: assert
+        name: 确认保存成功
+        textContains: 保存成功
+        timeout: 5000
+  - action: extract
+    name: 提取结果条数
+    selector: { css: '.result-count' }
+    into: doneCount
+  - action: screenshot
+    name: 存档结果页
+    fullPage: true

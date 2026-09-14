@@ -1,0 +1,11 @@
+version: 1
+name: with-include
+include:
+  - ./sub.yaml
+steps:
+  - action: goto
+    name: 主流程1
+    url: /main-1
+  - action: click
+    name: 主流程2
+    selector: { text: 提交 }

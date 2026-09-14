@@ -1,0 +1,9 @@
+version: 1
+name: sub
+steps:
+  - action: goto
+    name: 子流程1
+    url: /sub-1
+  - action: goto
+    name: 子流程2
+    url: /sub-2

@@ -1,0 +1,8 @@
+version: 1
+name: cycle-a
+steps:
+  - action: goto
+    name: a
+    url: /a
+include:
+  - ./cycle-b.yaml

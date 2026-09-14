@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="25yIFgeGCch2EAq2LBvYFb">
+<head data-page-node-id="1ak6mt7XMGvchJJYOBLHT0">
+<meta charset="UTF-8" data-page-node-id="aEkzEglBsxjTSfhekVGm47">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="SalX6IxlbtdiaTLtVCxyYn">
+<title>PBAgent 自愈闭环 · A→B→A→C 时间线</title>
+<style>
+  :root {
+    --blue: #2f7cf6; --blue-bg: #e6f1fb;
+    --red: #b3392e; --red-bg: #fcebEB;
+    --purple: #5b5bd6; --purple-bg: #eeedfe;
+    --teal: #0f6e56; --teal-bg: #e1f5ee;
+    --green: #3b6d11; --green-bg: #eaf3de;
+    --ink: #16202e; --muted: #6b7a94; --line: #d8e0ec;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", -apple-system, sans-serif;
+    background: #f4f6fa; color: var(--ink); padding: 32px 20px 60px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header h1 { font-size: 21px; font-weight: 600; }
+  header p { font-size: 13px; color: var(--muted); margin-top: 6px; line-height: 1.7; }
+  .controls { margin: 18px 0 6px; display: flex; gap: 10px; align-items: center; }
+  .btn {
+    border: none; cursor: pointer; border-radius: 8px; font-size: 13px; font-weight: 600;
+    padding: 9px 20px; background: var(--blue); color: #fff; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .88; }
+  .stage-caption {
+    font-size: 13.5px; line-height: 1.7; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 24px; min-height: 46px;
+  }
+  .stage-caption b { font-weight: 600; }
+
+  .rail { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+  .stage {
+    flex: 1 1 150px; min-width: 150px; border-radius: 12px; padding: 14px 14px 12px;
+    border: 1.5px solid var(--line); background: #fff; cursor: pointer;
+    transition: transform .15s, box-shadow .15s, border-color .15s; position: relative;
+  }
+  .stage:hover { transform: translateY(-2px); }
+  .stage .tag { font-size: 11px; font-weight: 700; letter-spacing: .5px; }
+  .stage .nm { font-size: 13.5px; font-weight: 600; margin-top: 5px; line-height: 1.45; }
+  .stage .dt { font-size: 12px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+  .stage .arrow {
+    position: absolute; right: -13px; top: 50%; transform: translateY(-50%);
+    color: #9aa8c0; font-size: 15px; font-weight: 700; z-index: 2;
+  }
+  .stage[data-on="1"] { box-shadow: 0 6px 20px rgba(22, 32, 46, .13); }
+  .st-a     { border-color: #b5d4f4; } .st-a[data-on="1"]     { background: var(--blue-bg);   border-color: var(--blue);   }
+  .st-a .tag { color: var(--blue); }
+  .st-fail  { border-color: #f0c9c9; } .st-fail[data-on="1"]  { background: var(--red-bg);    border-color: var(--red);    }
+  .st-fail .tag { color: var(--red); }
+  .st-b     { border-color: #cbcbf6; } .st-b[data-on="1"]     { background: var(--purple-bg); border-color: var(--purple); }
+  .st-b .tag { color: var(--purple); }
+  .st-c     { border-color: #9fe1cb; } .st-c[data-on="1"]     { background: var(--teal-bg);   border-color: var(--teal);   }
+  .st-c .tag { color: var(--teal); }
+  .st-v2    { border-color: #c0dd97; } .st-v2[data-on="1"]    { background: var(--green-bg);  border-color: var(--green);  }
+  .st-v2 .tag { color: var(--green); }
+
+  h2 { font-size: 15px; font-weight: 600; margin: 34px 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; font-size: 13px; }
+  th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 10px 14px; background: #eef2f8; }
+  td { padding: 9px 14px; border-top: 1px solid #edf1f7; line-height: 1.5; }
+  tr[data-on="1"] td { background: #fffbe9; }
+  .mono { font-family: Consolas, Menlo, monospace; font-size: 12px; color: #43526e; }
+  .pill { display: inline-block; border-radius: 20px; font-size: 11.5px; font-weight: 600; padding: 2px 10px; white-space: nowrap; }
+  .ok { background: var(--green-bg); color: var(--green); }
+  .fail { background: var(--red-bg); color: var(--red); }
+  .llm { background: var(--purple-bg); color: var(--purple); }
+  .note { color: var(--muted); font-size: 12px; }
+
+  .cards { display: flex; flex-wrap: wrap; gap: 14px; }
+  .card {
+    flex: 1 1 240px; background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card .k { font-size: 12.5px; color: var(--muted); }
+  .card .v { font-size: 25px; font-weight: 700; margin: 6px 0 4px; font-family: Consolas, Menlo, monospace; }
+  .card .d { font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .card.blue .v { color: var(--blue); } .card.purple .v { color: var(--purple); }
+  .card.teal .v { color: var(--teal); } .card.green .v { color: var(--green); }
+  footer { margin-top: 36px; font-size: 12px; color: var(--muted); line-height: 1.8; }
+  footer code { background: #eef2f8; border-radius: 4px; padding: 1px 6px; font-size: 11.5px; }
+</style>
+</head>
+<body data-page-node-id="68KpJ8STBf4K21P1QiUJ3a">
+<div class="wrap" data-page-node-id="vvKxg2xt0HPgF0ASBcmPyf">
+  <header data-page-node-id="SHzvpuGgw4Xvj8FGNIxDuO">
+    <h1 data-page-node-id="MCcayt5UoKcc0zlBlOUbao">PBAgent 自愈闭环 · A → B → A → C 时间线</h1>
+    <p data-page-node-id="XWSK8L2iFFkKHVTF30GmOR">Playbook 优先的混合执行模型：已知流程确定性执行（$0），页面改版失败时 LLM Agent 兜底自愈，自愈路径蒸馏为新版本 Playbook——花钱只发生在页面变化的那一次。下方步骤均取自真实 run 数据。</p>
+  </header>
+
+  <div class="controls" data-page-node-id="QskNyS9Ggk0A7Yx3Bouqlp">
+    <button class="btn" id="play" data-page-node-id="0KJ9iI0L3oSpZGGRecV8iN">▶ 自动演示</button>
+    <span class="note" data-page-node-id="fgbJtUfVkTTbfTTJq77bZp">或点击任意阶段卡片查看该阶段详情</span>
+  </div>
+  <div class="stage-caption" id="caption" data-page-node-id="HlHHPDQcWotjddwi4CH1A7"></div>
+
+  <div class="rail" id="rail" data-page-node-id="3LtIEFkkKIZWx6WZlgU1qh"></div>
+
+  <h2 data-page-node-id="2lFhVCVO7RmcSNuPXzhQHU">步骤时间线（run 2026-09-08_17-16-20 · variant-takeover-demo）</h2>
+  <table data-page-node-id="ECb5QKE8ukj5bjvG8pkeDf">
+    <thead data-page-node-id="0wOXlSS0zobjnvmKp0uvtN">
+      <tr data-page-node-id="HIBHSdhRdoqRAPAP5GdSgf"><th style="width:64px" data-page-node-id="r8VOo67eIOjk81RN6qfW21">步骤</th><th style="width:190px" data-page-node-id="SHG01BAXIdJ85pGeqMWcol">名称</th><th style="width:80px" data-page-node-id="zQE5TMPyeEOYfa7ERU1CGZ">动作</th><th style="width:86px" data-page-node-id="1c4Tu1ZB5WpgdqEj8Tww8c">状态</th><th style="width:90px" data-page-node-id="SQC2UTPiTFz4LaozJd6kCj">耗时</th><th data-page-node-id="MMwdBAKO10q0VtzJt5ES9e">说明</th></tr>
+    </thead>
+    <tbody id="tbody" data-page-node-id="ortfIIWPJDQBabM9FbrBaG"></tbody>
+  </table>
+
+  <h2 data-page-node-id="PWluSGVxFBfaz8xoS3JESK">成本结构（qwen3.8-max · $1.6 / $6.4 每 1M tokens）</h2>
+  <div class="cards" data-page-node-id="qznuw8kfRH82FiGUcZj1az">
+    <div class="card blue" data-page-node-id="KuI9nXQN3aODBb9uu0ZSLd">
+      <div class="k" data-page-node-id="jUYDFvDuTy9dIhNnJih7HL">STATE A · 稳定运行</div>
+      <div class="v" data-page-node-id="UBAcTZwUfdbaCF4onoYFPv">$0</div>
+      <div class="d" data-page-node-id="iobl15qUXUZFH98vx5TnsM">50 SKU 压测：209 步 22.6s，零 LLM 调用</div>
+    </div>
+    <div class="card purple" data-page-node-id="A1m6Da6MljBwtocjJAs0QF">
+      <div class="k" data-page-node-id="Fi0ICwR9KzvEhAhXJnajT5">STATE B · 自愈一次</div>
+      <div class="v" data-page-node-id="9RVkUWqcpcyUS8PIQuNbsC">$0.0417</div>
+      <div class="d" data-page-node-id="zvDJ1hCd4QjlvzXVp2aTOU">2 次调用 · 8,744 tokens（run 17-18-34 实测）</div>
+    </div>
+    <div class="card teal" data-page-node-id="ICSo3rw0GGLfQf1Y7wRMiv">
+      <div class="k" data-page-node-id="HBm8h1NSYLOwRhSWfMAYpX">STATE C · 沉淀</div>
+      <div class="v" data-page-node-id="nb9yXMZod5HfUEfpfbl2WU">v2 草稿</div>
+      <div class="d" data-page-node-id="2nbNAY3FoENMGw2rp3F9N4">css+text 双保险选择器 + dialog:accept，diff 人可读</div>
+    </div>
+    <div class="card green" data-page-node-id="ESgdlPy7PFhw2IrWdevhDE">
+      <div class="k" data-page-node-id="Pt0cKoizKeWH1bZi3TpZzc">沉淀后每次运行</div>
+      <div class="v" data-page-node-id="XFKJyA5Ir6MQhBQVGMoHQO">$0 · 2.6s</div>
+      <div class="d" data-page-node-id="jGEEDj3lAveioe11FAvVRy">promote v2 后同样改版页面纯 Playbook 通关</div>
+    </div>
+  </div>
+
+  <footer data-page-node-id="67c7CEnZE0DUsJTOnsZUi0">
+    数据来源：<code data-page-node-id="JR11M9AUnMbav8vn9TDFXg">runs/2026-09-08_17-16-20_variant-takeover-demo/run.json</code>（A→B→A 时间线）、
+    <code data-page-node-id="UTikMAyw1wvd4YBN7h1Mje">runs/2026-09-09_17-18-34_demo-reprice-v1/run.json</code>（自愈成本）、W7 闭环 E2E（v2 沉淀与 2.6s 复跑）。<br data-page-node-id="6YL6qlv5DgrfGbKgTthQU7">
+    复现命令：<code data-page-node-id="yVIbHCrj0gZjOvbGK9Evkj">pbagent run reprice.yaml --takeover --learn --baseUrl http://localhost:3456</code> →
+    <code data-page-node-id="D8vCfI7dc0wpj8N9g6jeON">pbagent diff</code> → <code data-page-node-id="797vPHZPIZlmwmdLRmblTZ">pbagent promote --to 2</code>。详见 <code data-page-node-id="TYRc2dYhMGhV5R2D2f2ybC">docs/RETRO.md</code>。
+  </footer>
+</div>
+
+<script>
+const stages = [
+  { key:'st-a',    tag:'STATE A',  name:'Playbook 确定性执行', dt:'登录 → 导航 → 填价 · $0',
+    cap:'<b>STATE A · Playbook v1 确定性执行。</b>s1–s6：打开登录页、填凭证、点登录、进改版编辑页、填新价格——全部按 YAML 步骤跑，零 LLM 调用，成本 $0。', rows:[0,1,2,3,4,5] },
+  { key:'st-fail', tag:'失败点',   name:'s7 点保存 · E1', dt:'variant=b 改版 · 5.0s 超时',
+    cap:'<b>失败点。</b>页面已改版（variant=b）：保存按钮改名「确认下单」、类名重命名、提交前多了 confirm 弹窗——Playbook 的 <b>text=保存</b> 选择器定位失败，分类 E1 元素定位失败，触发 STATE B 兜底。', rows:[6] },
+  { key:'st-b',    tag:'STATE B',  name:'LLM Agent 兜底', dt:'截图+DOM 感知 → 14.7s',
+    cap:'<b>STATE B · LLM Agent 兜底接管。</b>感知器采集截图 + DOM 压缩摘要，qwen3.8-max 推理出「确认下单」是提交保存表单的等价按钮（/api/sku/save），点击并自动 accept confirm 弹窗。1 步完成自愈，约 $0.04。', rows:[7] },
+  { key:'st-a',    tag:'STATE A',  name:'恢复点命中 · 断点续跑', dt:'19ms 收尾 · recovered',
+    cap:'<b>STATE A · 断点续跑。</b>Agent 操作后恢复点指纹命中「确认保存成功」，从断点继续执行 Playbook 剩余步骤，19ms 收尾。整次 run 状态 <b>recovered</b>，总耗时 23.2s。', rows:[8] },
+  { key:'st-c',    tag:'STATE C',  name:'轨迹蒸馏 → v2 草稿', dt:'原位替换 · 主文件不动',
+    cap:'<b>STATE C · 轨迹沉淀。</b>把 Agent 的自愈路径蒸馏回 Playbook：失败步骤原位替换为「点确认下单」，selector 生成 css+text 双保险，弹窗步骤带 dialog:accept，fill 值保留 ${params.x} 插值。产出 v2 草稿 + 步骤级 diff，主文件不动。', rows:[] },
+  { key:'st-v2',   tag:'飞轮闭合', name:'promote v2 → 零 LLM', dt:'同样改版 · 2.6s 通关',
+    cap:'<b>飞轮闭合。</b>人工确认 diff 后 promote v2：同样的改版页面，纯 Playbook 零 LLM 调用 2.6s 通关。LLM 成本是脉冲式的——只在页面变化的那一次发生，之后回到 $0。', rows:[] },
+];
+
+const steps = [
+  { id:'s1', name:'打开登录页',     act:'goto',  st:'ok',   ms:79,    note:'localhost:3456/login' },
+  { id:'s2', name:'填用户名',       act:'fill',  st:'ok',   ms:101,   note:'demo' },
+  { id:'s3', name:'填密码',         act:'fill',  st:'ok',   ms:50,    note:'***（脱敏）' },
+  { id:'s4', name:'点登录',         act:'click', st:'ok',   ms:117,   note:'text 选择器命中按钮' },
+  { id:'s5', name:'打开改版编辑页', act:'goto',  st:'ok',   ms:20,    note:'/sku/S040/edit?variant=b' },
+  { id:'s6', name:'填新价格',       act:'fill',  st:'ok',   ms:45,    note:'css=#price 命中' },
+  { id:'s7', name:'点保存',         act:'click', st:'fail', ms:5005,  note:'E1 元素定位失败 · 改版后按钮改名「确认下单」' },
+  { id:'B',  name:'Agent 兜底（1 步）', act:'llm', st:'llm', ms:14722, note:'感知(截图+DOM) → 决策点击「确认下单」→ confirm 自动 accept' },
+  { id:'s8', name:'恢复点命中「确认保存成功」', act:'assert', st:'ok', ms:19, note:'断点续跑收尾 · status=recovered · 总 23.2s' },
+];
+
+const rail = document.getElementById('rail');
+const tbody = document.getElementById('tbody');
+const caption = document.getElementById('caption');
+
+stages.forEach((s, i) => {
+  const el = document.createElement('div');
+  el.className = 'stage ' + s.key;
+  el.innerHTML = '<div class="tag">' + s.tag + '</div><div class="nm">' + s.name +
+    '</div><div class="dt">' + s.dt + '</div>' +
+    (i < stages.length - 1 ? '<div class="arrow">›</div>' : '');
+  el.onclick = () => { stop(); show(i); };
+  rail.appendChild(el);
+});
+
+steps.forEach(r => {
+  const tr = document.createElement('tr');
+  const pill = r.st === 'ok' ? '<span class="pill ok">ok</span>'
+    : r.st === 'fail' ? '<span class="pill fail">failed</span>'
+    : '<span class="pill llm">agent</span>';
+  tr.innerHTML = '<td class="mono">' + r.id + '</td><td>' + r.name + '</td><td class="mono">' + r.act +
+    '</td><td>' + pill + '</td><td class="mono">' + (r.ms >= 1000 ? (r.ms/1000).toFixed(1)+'s' : r.ms+'ms') +
+    '</td><td class="note">' + r.note + '</td>';
+  tbody.appendChild(tr);
+});
+
+let cur = -1, timer = null;
+function show(i) {
+  cur = i;
+  document.querySelectorAll('.stage').forEach((el, j) => el.dataset.on = j === i ? '1' : '0');
+  document.querySelectorAll('#tbody tr').forEach((tr, j) => {
+    tr.dataset.on = stages[i].rows.includes(j) ? '1' : '0';
+  });
+  caption.innerHTML = stages[i].cap;
+}
+function stop() { if (timer) { clearInterval(timer); timer = null; document.getElementById('play').textContent = '▶ 自动演示'; } }
+document.getElementById('play').onclick = () => {
+  if (timer) { stop(); return; }
+  document.getElementById('play').textContent = '⏸ 暂停';
+  let i = (cur + 1) % stages.length;
+  show(i);
+  timer = setInterval(() => { i = (i + 1) % stages.length; show(i); }, 2600);
+};
+show(0);
+</script>
+</body>
+</html>
