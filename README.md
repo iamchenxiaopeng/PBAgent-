@@ -32,17 +32,23 @@ PBAgent 的答案：**Playbook 优先**。已知流程走确定性执行，只�
 npm install
 npx playwright install chromium
 
-# 2. 起演示站点（含改版模拟开关）
+# 2. 配置环境变量
+cp .env.example .env    # 然后填入 PBA_LLM_API_KEY 等（见文件内注释）
+
+# 3. 起演示站点（含改版模拟开关）
 npm run cli -- dev:site   # 或: tsx test-site/server.ts
 
-# 3. 校验示例 Playbook
+# 4. 校验示例 Playbook
 npm run cli -- validate src/playbook/examples/reprice.yaml
 
-# 4. 跑起来（首次登录走全流程）
+# 5. 跑起来（首次登录走全流程）
 npm run cli -- run src/playbook/examples/reprice.yaml \
   --params '{"items":[{"id":"S001","price":"188"}]}' \
   --baseUrl http://localhost:3456
 ```
+
+> **不配 LLM 也能用**：STATE A（Playbook 确定性执行）零 LLM 依赖，纯跑 Playbook 不需要填 `.env`。
+> 只有失败兜底的 STATE B（LLM Agent 看截图自主探索）才用到，且**所选模型必须支持图像输入**——实测 `deepseek-flash` 可用，`deepseek-v4-pro` 不支持视觉。详见 `.env.example` 内注释。
 
 第二次运行会自动复用登录态（跳过登录子流程）；服务端踢下线后会自动重登（报告状态 `recovered`）。
 
