@@ -2,7 +2,7 @@ import { Command } from 'commander';
 import { readFileSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { chromium } from 'playwright';
+import { launchBrowser, newStealthPage } from '../browser/stealth.js';
 import { loadPlaybook } from '../playbook/loader.js';
 import { runWithAutoRelogin, type RunTrace } from '../executor/relogin.js';
 import { summarizeRun, writeReports } from '../reporter/report.js';
@@ -79,8 +79,9 @@ export const runCmd = new Command('run')
     if (authDomain) {
       console.log(`  session: ${sessionFile ? '复用已有登录态' : '无（将执行登录流程）'}`);
     }
-    const browser = await chromium.launch({ headless: opts.headed ? false : true });
-    const page = await browser.newPage(
+    const browser = await launchBrowser({ headed: opts.headed });
+    const page = await newStealthPage(
+      browser,
       sessionFile ? { storageState: sessionFile } : {},
     );
 

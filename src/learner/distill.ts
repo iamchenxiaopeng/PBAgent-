@@ -73,6 +73,10 @@ function distillAction(
     };
   }
 
+  // drag 不沉淀：拖滑块属于反爬对抗而非业务流程，
+  // 沉淀进 Playbook 会让下次重放时对着正常页面做无意义的拖动
+  if (act.action === 'drag') return null;
+
   if (act.action === 'goto') {
     return { action: 'goto', name: '打开页面', url: act.url };
   }

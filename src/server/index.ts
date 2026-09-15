@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import express from 'express';
-import { chromium, type Browser } from 'playwright';
+import { type Browser } from 'playwright';
+import { launchBrowser, newStealthContext } from '../browser/stealth.js';
 import { randomUUID } from 'node:crypto';
 import { runAgent, type AgentStep, type AgentResult } from '../agent/loop.js';
 import { getLlmConfig } from '../agent/llm.js';
@@ -75,11 +76,14 @@ let headedBrowser: Browser | null = null; // headed 独立实例（弹窗模式�
 const getBrowser = async (headed = false): Promise<Browser> => {
   if (headed) {
     if (!headedBrowser || !headedBrowser.isConnected()) {
-      headedBrowser = await chromium.launch({ headless: false, slowMo: 300 });
+      headedBrowser = await launchBrowser({ headed: true, slowMo: 300 });
     }
     return headedBrowser;
   }
-  if (!browser) browser = await chromium.launch({ headless: true });
+  if (!browser || !browser.isConnected()) {
+    // 断连后重建——否则复用死实例会抛 Target closed
+    browser = await launchBrowser();
+  }
   return browser;
 };
 
@@ -112,7 +116,7 @@ const slimStep = (s: AgentStep): Omit<AgentStep, 'screenshotBase64'> => {
 };async function executeTask(task: TaskRecord): Promise<void> {
   const { options } = task;
   const browserInstance = await getBrowser(Boolean(options.headed));
-  const context = await browserInstance.newContext();
+  const context = await newStealthContext(browserInstance);
   const page = await context.newPage();
   try {
     // 命中沉淀流程：Playbook 确定性执行（零 LLM）

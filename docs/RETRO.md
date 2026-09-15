@@ -152,9 +152,43 @@
 
 | 问题 | 等级 | 说明 |
 |------|------|------|
-| 无头 Chromium 被反爬识别（百度滑块验证码） | 中 | Agent 动作集无拖拽，只能判 fail；有头模式可能规避。需新增 drag/鼠标轨迹动作 |
-| 首轮真实站点样本仅 1 个站点 | 中 | 结论暂不能外推，需扩大站点样本（iframe/shadow DOM/懒加载场景仍未覆盖） |
+| 无头 Chromium 被反爬识别（百度滑块验证码） | 中 | **W10 已解决**：stealth 指纹擦除 + 清 cookie 自愈 + goto 直连结果页 + drag 动作，百度搜索任务 3 步跑通（详见 §9） |
+| 首轮真实站点样本仅 1 个站点 | 中 | 结论暂不能外推；W10 新增百度作为第二个样本，但 iframe/shadow DOM/懒加载场景仍未覆盖 |
 
 ---
 
-*相关文档：[PRD](PRD.md)｜[DESIGN](DESIGN.md)｜[SHARING（27 踩坑实录）](SHARING.md)｜[MVP-ACCEPTANCE](MVP-ACCEPTANCE.md)｜[演示：A→B→A→C 时间线](assets/abac-timeline.html)｜[README](../README.md)*
+## 9. W10 补记：反爬对抗首战（2026-09-15）
+
+**起因**：boss 要求"解决百度滑块验证"。W9 曾把它判为环境限制（动作集无拖拽），这次做了完整攻坚。
+
+### 9.1 三层根因（都不是"没有拖拽"那么简单）
+
+| 层 | 真相 | 怎么挖出来的 |
+|---|---|---|
+| 指纹暴露 | `navigator.webdriver=true`、UA 含 `HeadlessChrome`、`window.chrome` 缺失 | 探测脚本直接打印三项 |
+| **首页 cookie 风控** | 冷启动直连 `/s?wd=` 正常；**先访问首页再搜索必被拦** | 三组对照实验（含复测） |
+| 页面改版 | `#kw` 被 `.smart_input_superman .virtual-form{display:none}` 隐藏，可见输入框变为 `#chat-textarea` | 遍历 CSS 规则找命中项 |
+
+**最反直觉的一条**：真凶是**首页 cookie**，不是指纹。被拦后 `clearCookies()` 再访问同一 URL 就恢复（7 条结果）——风控标记挂在 cookie 上，不挂 IP。**清 cookie 比换 UA 管用**。
+
+### 9.2 四层修复
+
+1. **预防·指纹**：新增 `src/browser/stealth.ts`，统一入口 `launchBrowser()` / `newStealthContext()` / `newStealthPage()`，三处 launch 全量接入（避免漏改导致行为不一致）。UA 按 `browser.version()` 动态生成
+2. **预防·策略**：提示词规则 7——搜索站优先直接 goto 结果页，别碰首页搜索框
+3. **自愈**：感知到验证码页 → `clearCookies()`（零 token）+ 提示 LLM 重新 goto，单任务上限 2 次
+4. **能力**：新增 `drag` 动作，ease-out 曲线 + 抖动 + 随机停顿；drag 不进蒸馏（反爬对抗非业务流程）
+
+### 9.3 结果与成本
+
+百度搜索任务 **3 步 / 10.3s / $0.0038**，正确读出首条结果。对比 W9 的"4 步后判 fail"，从不可用变为可用。
+
+### 9.4 沉淀的方法论
+
+- **反爬问题先做入口路径对照实验**，再动代码。这次三组对照一次定位真凶，避免在指纹上瞎试
+- **自愈优先用确定性手段**（清 cookie），不要用 LLM 猜——零成本、可预测、可复现
+- **反爬结论易过期**（站点改版/风控升级）。代码注释里写清实测日期与结论，方便后人判断是否需要重验
+- **反爬是军备竞赛**：本轮方案是"规避为主、自愈为辅"，不追求硬刚验证码。真要过图形验证码（百度的 `tuxing_v2` 是旋转图片类，非滑块）需要接打码平台，投入产出比不高，暂不做
+
+---
+
+*相关文档：[PRD](PRD.md)｜[DESIGN](DESIGN.md)｜[SHARING（28 踩坑实录）](SHARING.md)｜[MVP-ACCEPTANCE](MVP-ACCEPTANCE.md)｜[演示：A→B→A→C 时间线](assets/abac-timeline.html)｜[README](../README.md)*

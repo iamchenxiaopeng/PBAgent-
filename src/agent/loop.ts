@@ -1,4 +1,4 @@
-import type { Page } from 'playwright';
+import type { Locator, Page } from 'playwright';
 import { snapshot, renderDomDigest, type PageSnapshot, type ElementInfo } from '../perception/snapshot.js';
 import { chat, extractJson, CostTracker, getLlmConfig, type ChatMessage, type ChatResult } from './llm.js';
 
@@ -11,6 +11,7 @@ import { chat, extractJson, CostTracker, getLlmConfig, type ChatMessage, type Ch
 
 export type AgentAction =
   | { action: 'click'; ref: number; reason: string }
+  | { action: 'drag'; ref: number; dx: number; dy: number; reason: string }
   | { action: 'fill'; ref: number; value: string; reason: string }
   | { action: 'press'; key: string; reason: string }
   | { action: 'goto'; url: string; reason: string }
@@ -82,6 +83,7 @@ const SYSTEM_PROMPT = `你是一个浏览器操作 Agent。用户给你一个任
 
 ## 可用动作（只输出一个 JSON 对象）
 {"action":"click","ref":<元素编号>,"reason":"<一句话理由>"}
+{"action":"drag","ref":<元素编号>,"dx":<水平像素位移>,"dy":<垂直像素位移>,"reason":"<一句话理由>"}
 {"action":"fill","ref":<元素编号>,"value":"<填入值>","reason":"<一句话理由>"}
 {"action":"press","key":"<键名，如 Enter>","reason":"..."}
 {"action":"goto","url":"<完整URL>","reason":"..."}
@@ -95,7 +97,17 @@ const SYSTEM_PROMPT = `你是一个浏览器操作 Agent。用户给你一个任
 3. 密码字段 fill 时直接填值（系统已注入，不会泄露）
 4. 任务完成（目标状态已出现）→ done；确认无法完成（页面缺失/无权限/死循环）→ fail
 5. 页面看起来没加载完 → wait 1000 后再观察
-6. 只输出 JSON，不要输出任何其他内容`;
+6. 只输出 JSON，不要输出任何其他内容
+7. 搜索类站点（百度/必应/谷歌等）**优先直接 goto 结果页 URL**（如 https://www.baidu.com/s?wd=关键词），
+   不要去点首页搜索框——首页交互风控极严，实测一交互就被拦到验证码页，
+   而冷启动直接访问结果页是正常的。这一条是预防，别等被拦了再补救
+
+## 遇到验证码 / 安全校验
+- 滑块类：用 drag 拖动手柄——看截图估算滑块需要移动的距离，填进 dx（正数向右），dy 通常填 0
+- 如果反复触发验证、始终无法通过，优先换路径而不是硬刚：
+  用 goto 直接访问目标页 URL（例如搜索站直接用 https://host/s?wd=关键词），
+  很多站点对首页交互风控极严、但直接访问结果页正常
+- 确实无法完成时再 fail，并在 summary 里说明是验证码拦截`;
 
 const REF_INDEX_IN_SNAPSHOT = 'snapshot';
 
@@ -172,6 +184,28 @@ async function locatorByRef(page: Page, ref: number): Promise<ReturnType<Page['l
   throw new Error(`ref ${ref} 定位失败（可见元素只有 ${visibleIdx} 个）`);
 }
 
+/**
+ * 同主域判断：取域名最后两段比较（www.baidu.com ↔ m.baidu.com 视为同主域）。
+ * 移动版/桌面版切换是常见的绕验证码手段，白名单只放行主域级别。
+ * 注意：不是完整的 public suffix 匹配（如 .co.uk 会偏松），
+ * 当前白名单来源是"用户给的起始 URL"，即用户已信任该站点，主域级别放行可接受。
+ */
+function sameRootDomain(host: string, domain: string): boolean {
+  const last2 = (h: string): string => h.split('.').slice(-2).join('.');
+  return last2(host) === last2(domain);
+}
+
+/** 验证码自愈（清 cookie）的单次任务上限——超过就不再尝试，交给 LLM 判 fail */
+const CAPTCHA_RESET_LIMIT = 2;
+
+/** 验证码页特征：URL 域名或页面文案命中即判定 */
+const CAPTCHA_URL_RE = /\/(captcha|verify|security|wappass)/i;
+const CAPTCHA_TEXT_RE = /安全验证|滑块验证|请完成安全验证|拖动滑块|captcha/i;
+
+function isCaptchaPage(url: string, bodyText: string): boolean {
+  return CAPTCHA_URL_RE.test(url) || CAPTCHA_TEXT_RE.test(bodyText.slice(0, 500));
+}
+
 /** 域名白名单校验 */
 function assertDomainAllowed(url: string, allowDomains: string[]): void {
   if (allowDomains.length === 0) return; // 空白名单 = 不限制（测试场景）
@@ -181,8 +215,45 @@ function assertDomainAllowed(url: string, allowDomains: string[]): void {
   } catch {
     throw new Error(`非法 URL: ${url}`);
   }
-  const ok = allowDomains.some((d) => host === d || host.endsWith(`.${d}`));
+  // 精确匹配 / 子域 / 同主域（含兄弟子域，如 m.baidu.com）
+  const ok = allowDomains.some(
+    (d) => host === d || host.endsWith(`.${d}`) || sameRootDomain(host, d),
+  );
   if (!ok) throw new Error(`目标域名 ${host} 不在白名单内（${allowDomains.join(', ')}）`);
+}
+
+/**
+ * 类人拖拽（滑块验证码用）。
+ *
+ * 直线匀速拖动会被风控秒拒，所以模拟真人：
+ *   - 先加速后减速（ease-out 曲线）
+ *   - 带轻微的 y 轴抖动与随机停顿
+ *   - 分段移动，每段之间 8~20ms 间隔
+ *
+ * @param dx 水平位移（正=向右）。滑块场景由 LLM 看截图估算缺口距离后给出
+ * @param dy 垂直位移（通常 0；需要纵向滑块时用）
+ */
+async function humanDrag(page: Page, el: Locator, dx: number, dy: number): Promise<void> {
+  const box = await el.boundingBox();
+  if (!box) throw new Error('拖拽目标无 boundingBox（元素不可见？）');
+  const startX = box.x + box.width / 2;
+  const startY = box.y + box.height / 2;
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.waitForTimeout(60 + Math.random() * 80); // 按下后的人类停顿
+
+  const segments = 24 + Math.floor(Math.random() * 12);
+  for (let i = 1; i <= segments; i++) {
+    const t = i / segments;
+    const eased = 1 - Math.pow(1 - t, 2); // 先快后慢
+    const jitter = Math.sin(t * Math.PI * 3) * 1.8 + (Math.random() - 0.5) * 1.2;
+    await page.mouse.move(startX + dx * eased, startY + dy * eased + jitter);
+    await page.waitForTimeout(8 + Math.random() * 12);
+  }
+
+  await page.waitForTimeout(50);
+  await page.mouse.up();
 }
 
 /** 执行一个原子动作（返回执行后的页面 URL） */
@@ -205,6 +276,11 @@ async function executeAction(page: Page, act: AgentAction): Promise<void> {
           await el.dispatchEvent('click');
         }
       }
+      return;
+    }
+    case 'drag': {
+      const el = await locatorByRef(page, act.ref);
+      await humanDrag(page, el, act.dx, act.dy);
       return;
     }
     case 'fill': {
@@ -257,6 +333,7 @@ export async function runAgent(page: Page, options: AgentOptions): Promise<Agent
 
   // 历史动作摘要（给 LLM 的短期记忆，防重复循环）
   const history: string[] = [];
+  let captchaResets = 0; // 已执行的验证码自愈次数（清 cookie）
 
   for (let i = 1; i <= stepsLimit; i++) {
     // 0. 外部停止检查（在感知与 LLM 调用前——停止时不烧任何 token）
@@ -269,6 +346,20 @@ export async function runAgent(page: Page, options: AgentOptions): Promise<Agent
     // 1. 感知
     const snap: PageSnapshot = await snapshot(page);
     log(`  [${i}${stepsLimit === Infinity ? '' : `/${stepsLimit}`}] 感知 ${snap.url}（${snap.elements.length} 元素，${snap.ms}ms）`);
+
+    // 1.5 验证码自愈（确定性兜底，不烧 token）：
+    // 实测百度——风控标记种在 cookie 里，被拦后清空 cookie 再访问同一 URL 就恢复正常
+    // （首页→搜索页必被拦，清 cookie 后重搜拿到 7 条结果）。
+    // 只做有限次，避免陷入"清了又被拦"的死循环。
+    if (isCaptchaPage(snap.url, snap.bodyText) && captchaResets < CAPTCHA_RESET_LIMIT) {
+      captchaResets++;
+      await page.context().clearCookies().catch(() => {});
+      log(`      ⚠ 检测到验证码页，已清空站点 cookie 尝试自愈（第 ${captchaResets}/${CAPTCHA_RESET_LIMIT} 次）`);
+      history.push(
+        `【系统】上一步撞上验证码页。已自动清空该站点 cookie 并重置风控标记。` +
+          `请重新 goto 目标 URL（搜索类站点直接用结果页地址），不要再去操作首页。`,
+      );
+    }
 
     // 2. 决策（LLM）
     const llmStarted = Date.now();
@@ -384,6 +475,7 @@ function describeAction(act: AgentAction, ok: boolean, error?: string): string {
   const status = ok ? '' : `（失败: ${error?.slice(0, 50)}）`;
   switch (act.action) {
     case 'click': return `click ref=${act.ref} ${status}`;
+    case 'drag': return `drag ref=${act.ref} dx=${act.dx} dy=${act.dy} ${status}`.trim();
     case 'fill': return `fill ref=${act.ref} value="${act.value.slice(0, 30)}" ${status}`.trim();
     case 'press': return `press ${act.key} ${status}`.trim();
     case 'goto': return `goto ${act.url.slice(0, 60)} ${status}`.trim();
@@ -398,6 +490,19 @@ function parseAction(raw: string): AgentAction {
   const action = parsed.action;
   if (action === 'click' && typeof parsed.ref === 'number') {
     return { action, ref: parsed.ref, reason: String(parsed.reason ?? '') };
+  }
+  if (
+    action === 'drag' &&
+    typeof parsed.ref === 'number' &&
+    typeof parsed.dx === 'number'
+  ) {
+    return {
+      action,
+      ref: parsed.ref,
+      dx: parsed.dx,
+      dy: typeof parsed.dy === 'number' ? parsed.dy : 0,
+      reason: String(parsed.reason ?? ''),
+    };
   }
   if (action === 'fill' && typeof parsed.ref === 'number' && typeof parsed.value === 'string') {
     return { action, ref: parsed.ref, value: parsed.value, reason: String(parsed.reason ?? '') };

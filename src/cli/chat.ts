@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { chromium } from 'playwright';
+import { launchBrowser, newStealthPage } from '../browser/stealth.js';
 import { runAgent, type AgentResult } from '../agent/loop.js';
 import { getLlmConfig, LlmConfigError } from '../agent/llm.js';
 import { normalizeDomain } from '../credentials/store.js';
@@ -106,8 +106,8 @@ export const chatCmd = new Command('chat')
       process.env[k] = v;
     }
 
-    const browser = await chromium.launch({ headless: !opts.headed });
-    const page = await browser.newPage(sessionFile ? { storageState: sessionFile } : {});
+    const browser = await launchBrowser({ headed: opts.headed });
+    const page = await newStealthPage(browser, sessionFile ? { storageState: sessionFile } : {});
     try {
       await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     } catch (e) {
