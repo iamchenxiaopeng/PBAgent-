@@ -1,6 +1,6 @@
 import type { Locator, Page } from 'playwright';
 import { snapshot, renderDomDigest, type PageSnapshot, type ElementInfo } from '../perception/snapshot.js';
-import { chat, extractJson, CostTracker, getLlmConfig, type ChatMessage, type ChatResult } from './llm.js';
+import { chat, extractJson, CostTracker, getLlmConfig, LlmError, type ChatMessage, type ChatResult } from './llm.js';
 
 /**
  * STATE B：LLM Agent 决策循环（DESIGN F-04）。
@@ -113,6 +113,22 @@ const REF_INDEX_IN_SNAPSHOT = 'snapshot';
 
 /** 单轮决策的最大尝试次数（解析失败时带纠错提示重试） */
 const DECIDE_MAX_ATTEMPTS = 3;
+/**
+ * 决策调用的 token 上限基数（实际按 attempt 递增：base、2×base、3×base）。
+ * 思考型模型（deepseek-flash 带 reasoning_content）会把额度烧在推理上——
+ * 实测单步推理约 15-70 tokens，但复杂页面可更长；一旦烧满 max_tokens，
+ * finish_reason=length 而 content 为空。递增上限是这类空输出最直接的对策。
+ */
+const DECIDE_BASE_TOKENS = 1000;
+
+/**
+ * 空输出后的追加提示（system 角色，避免连续 user 消息）。
+ * 思考型模型偶发"只在 reasoning 里想、content 里什么都不写"，
+ * 明确要求它跳过推理直接给结论——实测能把二次成功率拉起来。
+ */
+const EMPTY_OUTPUT_HINT =
+  '【重要】上一次响应内容为空（可能把输出额度消耗在思考过程里了）。' +
+  '请跳过思考过程，直接输出一个 JSON 动作对象，不要输出任何其他内容。';
 
 /** 解析失败后的纠错提示（把模型上一次的坏输出一并回传，让它自我纠正） */
 const CORRECTION_PROMPT =
@@ -123,8 +139,31 @@ const CORRECTION_PROMPT =
  * 一轮决策：输出解析失败时带上模型自己的坏输出重试，让它自我纠正。
  * 用尽次数才抛错终止任务——模型偶发吐 DSML/围栏不应让整个任务失败。
  */
+/** 决策上下文（重试时按降级策略重新组装请求，而不是原地重试同一份） */
+interface DecideContext {
+  task: string;
+  snap: PageSnapshot;
+  history: string[];
+  /** 是否允许携带截图（Web 端可关闭；false = 纯 DOM 通道） */
+  withScreenshot: boolean;
+}
+
+/**
+ * 单次决策：感知 → LLM → 解析动作。
+ *
+ * 失败重试分两类，都要覆盖：
+ * 1. **调用失败**（空 content / 超时 / 429 / 5xx）——以前 chat() 在 try 之外，
+ *    一抛错就直接冒泡，整个任务被判 error，前几步全白跑（#29 的根因）。
+ * 2. **解析失败**（模型吐 DSML 或非 JSON）——把坏输出回传要求纠正。
+ *
+ * 降级阶梯（每次重试都换一种请求形态，不是原地重复）：
+ *   attempt 1: jsonMode + 截图 + 1×tokens
+ *   attempt 2: jsonMode + 截图 + 2×tokens
+ *   attempt 3: 无 json 约束 + 纯 DOM（去图）+ 3×tokens
+ * json_object 约束与图像输入都是已知的偶发空输出诱因，最后一次两个都去掉。
+ */
 async function decideAction(
-  userContent: ChatMessage['content'],
+  ctx: DecideContext,
   overrides: AgentOptions['llmOverrides'],
   tracker: CostTracker,
   log: (msg: string) => void,
@@ -134,14 +173,42 @@ async function decideAction(
   const corrections: ChatMessage[] = [];
 
   for (let attempt = 1; attempt <= DECIDE_MAX_ATTEMPTS; attempt++) {
-    const raw = await chat(
-      [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userContent },
-        ...corrections,
-      ],
-      { maxTokens: 1000, overrides, jsonMode: true },
-    );
+    const isLast = attempt === DECIDE_MAX_ATTEMPTS;
+    const useShot = !isLast && ctx.withScreenshot && ctx.snap.screenshotBase64.length > 0;
+    const userContent: ChatMessage['content'] = [
+      { type: 'text', text: buildUserPrompt(ctx.task, ctx.snap, ctx.history, useShot) },
+      ...(useShot
+        ? [{ type: 'image_url' as const, image_url: { url: `data:image/png;base64,${ctx.snap.screenshotBase64}` } }]
+        : []),
+    ];
+
+    let raw: ChatResult;
+    try {
+      raw = await chat(
+        [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userContent },
+          ...corrections,
+        ],
+        {
+          maxTokens: DECIDE_BASE_TOKENS * attempt,
+          overrides,
+          jsonMode: !isLast,
+        },
+      );
+    } catch (e) {
+      lastErr = e;
+      const err = e as LlmError;
+      const retryable = err instanceof LlmError ? err.retryable : false;
+      if (err.usage) tracker.add(err.usage); // 失败调用也烧了钱（截断输出照计费），必须记账
+      const tail = !retryable ? '—不可重试，放弃' : isLast ? '—已用尽重试' : '—将重试';
+      log(`      决策调用失败（第 ${attempt}/${DECIDE_MAX_ATTEMPTS} 次）：${err.message.slice(0, 80)}${tail}`);
+      if (!retryable || isLast) throw err;
+      // 没拿到模型输出，无法构造 correction；追加提示压制"只思考不输出"
+      corrections.push({ role: 'system', content: EMPTY_OUTPUT_HINT });
+      continue;
+    }
+
     tracker.add(raw.usage); // 重试同样烧钱，全部计入成本
     usage = raw.usage;
     try {
@@ -362,16 +429,25 @@ export async function runAgent(page: Page, options: AgentOptions): Promise<Agent
     }
 
     // 2. 决策（LLM）
+    // 请求组装与降级策略都在 decideAction 内部（重试时逐层去 json 约束 / 去截图 / 加 token 上限）
     const llmStarted = Date.now();
-    // 截图可能因字体加载超时降级为空——此时不发包，退化为纯 DOM 决策
-    const hasShot = withScreenshot && snap.screenshotBase64.length > 0;
-    const userContent: ChatMessage['content'] = [
-      { type: 'text', text: buildUserPrompt(task, snap, history, hasShot) },
-      ...(hasShot
-        ? [{ type: 'image_url' as const, image_url: { url: `data:image/png;base64,${snap.screenshotBase64}` } }]
-        : []),
-    ];
-    const { act, usage } = await decideAction(userContent, options.llmOverrides, tracker, log);
+    let decision: { act: AgentAction; usage?: ChatResult['usage'] };
+    try {
+      decision = await decideAction(
+        { task, snap, history, withScreenshot },
+        options.llmOverrides,
+        tracker,
+        log,
+      );
+    } catch (e) {
+      // 单步决策失败不该毁掉整个任务：已执行的步骤、截图、成本都要保留下来出报告，
+      // 否则一次网关抖动就让前面几步的 token 全白烧（#29）。
+      const msg = (e as Error).message;
+      summary = `LLM 决策失败，任务中止于第 ${i} 步（已完成 ${steps.length} 步）：${msg.slice(0, 160)}`;
+      log(`  ✗ ${summary}`);
+      break;
+    }
+    const { act, usage } = decision;
     const llmMs = Date.now() - llmStarted;
     log(`      决策 ${act.action}${'ref' in act ? ` ref=${act.ref}` : ''}（${llmMs}ms）— ${act.reason.slice(0, 60)}`);
 

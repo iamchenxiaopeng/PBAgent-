@@ -199,7 +199,7 @@ LLM 响应的 usage 字段逐次记账（CostTracker），按模型单价表折�
 
 ---
 
-# 六、踩坑实录（28 个问题全量）
+# 六、踩坑实录（29 个问题全量）
 
 > 每个问题按「现象 → 定位 → 根因 → 修复 → 通用教训」展开。按层面分组，编号即修复顺序。
 
@@ -235,6 +235,7 @@ LLM 响应的 usage 字段逐次记账（CostTracker），按模型单价表折�
 | 26 | 模型不吐 JSON 改吐 DSML 工具调用标记 | LLM 接口 | 高（任务终止） |
 | 27 | 截图卡在 `waiting for fonts to load` 超时 30s | 感知器 | 高（真实站点） |
 | 28 | Agent 操作百度必被拦到验证码页（指纹暴露 + 首页 cookie 风控） | 反爬对抗 | 高（真实站点） |
+| 29 | LLM 返回空 content → 整个任务判 error，前 4 步白跑（重试未覆盖调用失败） | LLM 接口 | 高（任务终止） |
 
 ## 问题 1：zod `.default()` 在 include 展开后静默丢失（最值得分享）
 
@@ -517,6 +518,67 @@ res.redirect(302, `${base}${sep}saved=${id}`);
 - **反爬对抗要分"预防"和"自愈"两层做，且自愈优先用确定性手段**（清 cookie），别一上来就让 LLM 猜
 - **诊断反爬问题时，先做路径对照实验**（哪个入口被拦、哪个不拦），比直接改指纹有效得多——这次三组对照实验一次定位到"首页 cookie"这个真凶，否则会在指纹上白耗时间
 - **本地 test-site 永远测不到反爬**。这类问题只能靠真实站点暴露，且**结论易过期**（站点改版/风控升级），代码里要把实测日期和结论写进注释，方便后人判断是否需要重新验证
+
+---
+
+### 29：LLM 返回空 content → 整个任务被判 error，前 4 步白跑（重试机制形同虚设）
+
+**现象**：Web 控制台跑本地改价任务，前 4 步（登录 → 进 SKU 列表）全部正常，第 5 步感知完 50 个元素的页面后任务**无声停止**——没有失败日志、没有重试记录、时间线停在第 4 步。报错只有一句 `LLM 返回空 content`。
+
+**排查**：先确认是不是稳态故障。写探测脚本，用真实页面（登录 → `/sku/list`，50 元素 + 截图）复刻决策请求，交叉 `jsonMode` × `maxTokens` 共 6 组——**6 次全部正常返回**，所以是偶发。但探测抓到两条关键情报：
+
+```
+usage.completion_tokens_details: {"reasoning_tokens": 15}   ← 是思考型模型，带 reasoning_content
+content: "{\"action\":\"click\",\"ref\":1,...}\n\nWait, I need to output only JSON. Let me output the JSON object.<｜end▁of▁thinking｜>{...}"
+                                                            ↑ 思考残留混进 content，两个 JSON 连排（靠 extractJson 括号配对救回）
+```
+
+**根因（真正的 bug 不在模型，在代码）**：
+
+```ts
+for (let attempt = 1; attempt <= 3; attempt++) {
+  const raw = await chat(...);   // ← 在 try 之外！
+  try { return parseAction(raw.text); } catch { /* 只有解析失败才重试 */ }
+}
+```
+
+`chat()` 抛的 `LlmError`（空 content / 超时 / 429 / 5xx）**完全绕过了重试循环**，直接冒泡到 `runAgent` → 服务端 catch → 整个任务判 error。**已执行的 4 步截图、轨迹、花掉的 token 全部丢弃**。所谓"三层防御"（#26 那次加的）只对"模型吐了坏格式"生效，对"模型什么都没吐"完全无效。
+
+空 content 本身的成因：思考型模型把 `max_tokens`（决策固定 1000）烧在 `reasoning_content` 上，`finish_reason=length` 而 `content` 为空。
+
+**修复（四层）**：
+
+| 层 | 做法 |
+|---|---|
+| 诊断 | `chat()` 空 content 时抛错附带 `finish_reason` / `completion_tokens` / reasoning 长度；`LlmError` 新增 `retryable`（空输出/超时/429/5xx 可重试，400/401/403 不可重试）和 `usage` |
+| 重试 | `chat()` 调用**移进 try**，调用失败与解析失败走同一套重试；重试前追加 system 提示「跳过思考过程，直接输出 JSON」 |
+| 降级 | 每次重试**换一种请求形态**而非原地重复：<br>① jsonMode + 截图 + 1×tokens → ② jsonMode + 截图 + 2×tokens → ③ **无 json 约束 + 纯 DOM（去图）** + 3×tokens<br>（`response_format:json_object` 和图像输入都是已知的偶发空输出诱因，最后一次两个都去掉） |
+| 兜底 | `runAgent` 里决策彻底失败时**不再抛异常**：保留已完成的 steps，输出 `summary = "LLM 决策失败，任务中止于第 N 步（已完成 M 步）：原因"`，报告照常生成 |
+| 记账 | 失败调用也 `tracker.add(err.usage)` —— 网关对 `finish_reason=length` 的截断输出**照样收费**，不记账会让成本统计失真（实测：3 次失败烧了 1000+2000+3000 tokens 却显示 `llmCalls=0`） |
+
+**验证**：起 mock 网关**必然**返回空 content（可控复现，不靠偶发）：
+
+```
+Case A（第 1 次空、第 2 次恢复）：
+  决策调用失败（第 1/3 次）：LLM 返回空 content（finish_reason=length，completion_tokens=1000，reasoning长度=32）—将重试
+  决策 wait（22ms）— mock 决策          ← 恢复，任务继续跑完 3 步，不再中止
+
+Case B（连续 3 次空）：
+  第 1/3 次（1000 tokens, json, 有图）—将重试
+  第 2/3 次（2000 tokens, json, 有图）—将重试
+  第 3/3 次（3000 tokens, 无 json, 无图）—已用尽重试
+  ✗ LLM 决策失败，任务中止于第 1 步（已完成 0 步）：…   ← 结构化退出，不抛异常
+  请求序列确认降级阶梯生效：maxTokens 1000→2000→3000，jsonMode true→true→false，hasImage true→true→false
+```
+
+真实模型端到端：8 步任务全部完成，8 次 LLM 调用无一空 content。
+
+**通用教训**：
+- **写完重试先问一句"它覆盖了所有失败路径吗"**：#26 加的重试只包了 `parseAction`，把 `chat()` 留在 try 外面——防御写了等于没写。**重试循环必须把"调用"和"解析"一起包进去**
+- **重试要换形态，不要原地重复**：同样的请求再发一次，模型很可能以同样方式再失败一次。加大 token 上限、去掉 JSON 约束、去掉图片，每次都消除一个可能的诱因
+- **单步失败不该毁掉整条任务**：已执行的步骤、截图、花掉的钱都是资产。宁可输出"中止于第 N 步 + 原因"，也别抛异常让 everything 归零
+- **失败调用也要记账**：`finish_reason=length` 的截断输出网关照样按 completion_tokens 收费，只统计成功调用会让成本报表严重偏低
+- **偶发故障要靠 mock 验证**：真实 API 6 次全正常，根本复现不了。起一个能**必然**产生该故障的 mock 服务（HTTP 层拦截），才能确定性地验证容错逻辑真的生效
 
 ---
 

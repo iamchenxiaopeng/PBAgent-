@@ -72,7 +72,17 @@ export interface ChatOptions {
 }
 
 export class LlmError extends Error {
-  constructor(message: string, public readonly status?: number) {
+  /**
+   * @param retryable 是否值得重试（网络/超时/空输出/5xx/429 可重试；400/401/403 重试无意义）
+   * @param usage 失败调用已消耗的 tokens（网关对 finish_reason=length 的截断输出照样计费，
+   *              不记账会让成本统计失真——失败越多次，漏记越多）
+   */
+  constructor(
+    message: string,
+    public readonly status?: number,
+    public readonly retryable = false,
+    public readonly usage?: ChatResult['usage'],
+  ) {
     super(message);
     this.name = 'LlmError';
   }
@@ -114,19 +124,39 @@ export async function chat(messages: ChatMessage[], options: ChatOptions = {}): 
 
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
-      throw new LlmError(`LLM 请求失败 ${resp.status}: ${body.slice(0, 200)}`, resp.status);
+      // 429/5xx 值得重试（网关抖动）；4xx 参数/鉴权类重试无意义，直接抛
+      const retryable = resp.status === 429 || resp.status >= 500;
+      throw new LlmError(`LLM 请求失败 ${resp.status}: ${body.slice(0, 200)}`, resp.status, retryable);
     }
     const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{
+        message?: { content?: string | null; reasoning_content?: string | null };
+        finish_reason?: string;
+      }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     };
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) throw new LlmError('LLM 返回空 content');
+    const message = data.choices?.[0]?.message;
+    const content = message?.content;
+
+    // 空 content（含纯空白）是可重试的偶发故障，且必须带诊断信息：
+    // 思考型模型（如 deepseek-flash，带 reasoning_content）可能把 max_tokens 烧在推理上，
+    // 导致 finish_reason=length 而 content 为空——此时加大 max_tokens 重试即可恢复。
+    if (typeof content !== 'string' || content.trim() === '') {
+      const finish = data.choices?.[0]?.finish_reason ?? 'unknown';
+      const out = data.usage?.completion_tokens ?? 0;
+      const reasoningLen = message?.reasoning_content?.length ?? 0;
+      throw new LlmError(
+        `LLM 返回空 content（finish_reason=${finish}，completion_tokens=${out}，reasoning长度=${reasoningLen}）`,
+        undefined,
+        true, // 可重试
+        data.usage, // 截断的输出已计费，必须记账
+      );
+    }
     return { text: content, usage: data.usage };
   } catch (e) {
     if (e instanceof LlmError) throw e;
-    if ((e as Error).name === 'AbortError') throw new LlmError('LLM 请求超时');
-    throw new LlmError(`LLM 请求异常: ${(e as Error).message}`);
+    if ((e as Error).name === 'AbortError') throw new LlmError('LLM 请求超时', undefined, true);
+    throw new LlmError(`LLM 请求异常: ${(e as Error).message}`, undefined, true);
   } finally {
     clearTimeout(timer);
   }
