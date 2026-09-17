@@ -3,9 +3,10 @@ import { ref, reactive, onMounted } from 'vue';
 import Sidebar from './components/Sidebar.vue';
 import HomeView from './components/HomeView.vue';
 import SessionView from './components/SessionView.vue';
+import DraftsView from './components/DraftsView.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 
-const view = ref('home'); // home | session
+const view = ref('home'); // home | session | drafts
 const activeSession = ref(null); // { id, title }
 const settingsOpen = ref(false);
 const health = reactive({ loaded: false, llm: { configured: false, model: '' } });
@@ -19,6 +20,11 @@ const openSession = (s) => {
 
 const goHome = () => {
   view.value = 'home';
+  activeSession.value = null;
+};
+
+const openDrafts = () => {
+  view.value = 'drafts';
   activeSession.value = null;
 };
 
@@ -41,9 +47,11 @@ onMounted(() => {
   <div class="app-shell">
     <Sidebar
       :active-id="activeSession?.id ?? null"
+      :active-view="view"
       :version="sessionsVersion"
       @select="openSession"
       @new="goHome"
+      @open-drafts="openDrafts"
       @open-settings="settingsOpen = true"
     />
     <main class="main-area">
@@ -51,6 +59,7 @@ onMounted(() => {
         v-if="view === 'home'"
         :health="health"
         @session-started="openSession"
+        @open-drafts="openDrafts"
         @sessions-changed="refreshSessions"
       />
       <SessionView
@@ -61,6 +70,7 @@ onMounted(() => {
         @back="goHome"
         @sessions-changed="refreshSessions"
       />
+      <DraftsView v-else-if="view === 'drafts'" @open-home="goHome" />
     </main>
     <SettingsPanel v-if="settingsOpen" :health="health" @close="settingsOpen = false" />
   </div>

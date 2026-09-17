@@ -3,9 +3,10 @@ import { ref, onMounted, watch } from 'vue';
 
 const props = defineProps({
   activeId: { type: String, default: null },
+  activeView: { type: String, default: 'home' },
   version: { type: Number, default: 0 },
 });
-const emit = defineEmits(['select', 'new', 'open-settings']);
+const emit = defineEmits(['select', 'new', 'open-drafts', 'open-settings']);
 
 const sessions = ref([]);
 const loading = ref(true);
@@ -76,6 +77,10 @@ const commitDelete = async (id) => {
 
     <button class="new-btn" @click="emit('new')">
       <span class="plus">+</span> 新会话
+    </button>
+
+    <button class="nav-btn" :class="{ active: props.activeView === 'drafts' }" @click="emit('open-drafts')">
+      <span class="nav-icon">⚡</span> 沉淀库
     </button>
 
     <div class="session-list">
@@ -172,6 +177,24 @@ const commitDelete = async (id) => {
 }
 .new-btn:hover { color: var(--text); background: #e4e4e8; }
 .plus { font-size: 15px; line-height: 1; }
+
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 10px;
+  padding: 9px 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.12s;
+}
+.nav-btn:hover { color: var(--text); background: var(--bg-hover); }
+.nav-btn.active { color: var(--text); background: var(--bg-panel); font-weight: 600; }
+.nav-icon { font-size: 12px; }
 
 .session-list {
   flex: 1;

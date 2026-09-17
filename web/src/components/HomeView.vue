@@ -2,7 +2,7 @@
 import { ref, reactive, onMounted } from 'vue';
 
 const props = defineProps({ health: Object });
-const emit = defineEmits(['session-started', 'sessions-changed']);
+const emit = defineEmits(['session-started', 'sessions-changed', 'open-drafts']);
 
 /** 设置里持久化的默认值（SettingsPanel 写 localStorage） */
 const defaults = reactive({
@@ -48,13 +48,15 @@ const matchHit = ref(null);
 const paramValues = reactive({});
 const paramError = ref('');
 
-/** 沉淀流程快捷卡（主页展示已沉淀的流程） */
+/** 沉淀流程快捷卡（主页展示已沉淀的流程）
+ *  走 /api/drafts：列出 playbooks/ 下全部流程（含自动沉淀、尚无版本链的新草稿）；
+ *  旧的 /api/playbooks 只列有过版本链的流程，会把 F-10 自动产物漏掉。 */
 const playbooks = ref([]);
 onMounted(async () => {
   try {
-    const r = await fetch('/api/playbooks');
+    const r = await fetch('/api/drafts');
     const d = await r.json();
-    playbooks.value = (d.items ?? []).filter((p) => p.currentVersion >= 1).slice(0, 4);
+    playbooks.value = (d.items ?? []).slice(0, 4);
   } catch { /* 忽略 */ }
 });
 
@@ -304,7 +306,10 @@ const canSubmit = () => Boolean(url.value.trim() && task.value.trim()) && !submi
     </div>
 
     <div v-if="playbooks.length" class="quick-card">
-      <div class="quick-title">已沉淀流程</div>
+      <div class="quick-head">
+        <span class="quick-title">已沉淀流程</span>
+        <button class="quick-all" @click="emit('open-drafts')">沉淀库 →</button>
+      </div>
       <div class="quick-list">
         <button v-for="pb in playbooks" :key="pb.name" class="quick-item" @click="quickRun(pb)">
           <span class="q-name">{{ pb.name }}</span>
@@ -392,10 +397,20 @@ const canSubmit = () => Boolean(url.value.trim() && task.value.trim()) && !submi
 .match-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 10px; line-height: 1.5; }
 
 .quick-card { margin-top: 28px; }
+.quick-head { display: flex; justify-content: space-between; align-items: baseline; }
 .quick-title {
-  font-size: 12px; color: var(--text-faint); margin-bottom: 10px;
+  font-size: 12px; color: var(--text-faint);
   text-transform: uppercase; letter-spacing: 0.5px;
 }
+.quick-all {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.quick-all:hover { color: var(--text); }
 .quick-list { display: flex; flex-direction: column; gap: 6px; }
 .quick-item {
   display: flex; justify-content: space-between; align-items: center;

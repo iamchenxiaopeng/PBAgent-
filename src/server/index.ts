@@ -10,6 +10,7 @@ import {
   listSessions, getSession, createSession, appendUserMessage, appendTaskMessage,
   completeTaskMessage, renameSession, deleteSession, buildMemoryContext,
 } from './sessions.js';
+import { listDistilled, readDistilled, deleteDistilled } from './drafts.js';
 import { listAllPlaybookVersions, readVersionDiff } from './playbook-history.js';
 import { selectPlaybook, llmReady } from '../router/select.js';
 import { runPlaybookSteps, type StepTrace, type RunTrace } from '../executor/engine.js';
@@ -661,6 +662,42 @@ app.get('/api/playbooks/:name/diff/:v', (req: Request<{ name: string; v: string 
     return;
   }
   res.type('text/markdown; charset=utf-8').send(diff);
+});
+
+/* ===== 沉淀库（列表 / 明细 / 删除）=====
+ * 与 /api/playbooks 的区别：那套只列「有过版本链」的流程，
+ * 这里列出 playbooks/ 下全部流程（含 F-10 自动沉淀、尚无版本链的新草稿）。
+ */
+
+app.get('/api/drafts', (_req: unknown, res: Response) => {
+  const dir = join(process.cwd(), 'playbooks');
+  res.json({ items: listDistilled(dir) });
+});
+
+app.get('/api/drafts/:name', (req: Request<{ name: string }>, res: Response) => {
+  const detail = readDistilled(join(process.cwd(), 'playbooks'), req.params.name);
+  if (!detail) {
+    res.status(404).json({ error: '沉淀流程不存在' });
+    return;
+  }
+  res.json(detail);
+});
+
+app.delete('/api/drafts/:name', (req: Request<{ name: string }>, res: Response) => {
+  const dir = join(process.cwd(), 'playbooks');
+  // versions=0 → 只删主文件，保留 .versions/ 历史（默认一起删，不留孤儿版本）
+  const withVersions = req.query.versions !== '0';
+  try {
+    const r = deleteDistilled(dir, req.params.name, withVersions);
+    if (r.missing) {
+      res.status(404).json({ error: '沉淀流程不存在（可能已被删除）' });
+      return;
+    }
+    clearIntentCache(); // 删除后意图缓存里的引用要失效
+    res.json({ ok: true, removed: r.removed });
+  } catch (e) {
+    res.status(400).json({ error: (e as Error).message });
+  }
 });
 
 app.get('/api/history', (req: Request, res: Response) => {
