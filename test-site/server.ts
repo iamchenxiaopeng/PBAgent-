@@ -79,6 +79,19 @@ const SKUS = Array.from({ length: 50 }, (_, i) => ({
   price: 100 + i,
 }));
 
+/** 演示数据重置：价格回初值（连续多场演示的数据一致性保障） */
+app.post('/api/reset', (_req, res) => {
+  let changed = 0;
+  SKUS.forEach((s, i) => {
+    const initial = 100 + i;
+    if (s.price !== initial) {
+      s.price = initial;
+      changed++;
+    }
+  });
+  res.send(page('重置', `<h1>已重置 ${changed} 个 SKU 的价格</h1><p><a href="/sku/list">查看列表</a></p>`));
+});
+
 /**
  * SKU 编辑页 —— 改版模拟核心：
  * variant=b 时：保存按钮改文本 + 类名重命名 + 弹确认对话框（E1/E2 测试点）

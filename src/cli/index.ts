@@ -10,7 +10,7 @@ const program = new Command();
 program
   .name('pbagent')
   .description('Playbook + LLM 混合式浏览器操作 Agent')
-  .version('0.1.0');
+  .version('1.1.0');
 
 program.addCommand(validateCmd);
 program.addCommand(runCmd);

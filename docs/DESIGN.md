@@ -1,9 +1,10 @@
 # 开发文档：PBAgent — Playbook + LLM 混合式浏览器操作 Agent
 
-- 版本：v1.0
-- 日期：2026-09-08
+- 版本：v1.1（对齐实现修订版）
+- 日期：2026-09-16（初版 2026-09-08）
 - 配套文档：`docs/PRD.md`（需求文档，功能编号 F-01 ~ F-10 与本文对应）
-- 技术栈：Node.js ≥ 20 + TypeScript + Playwright + LangGraph.js + Qwen-VL/GPT-4o + js-yaml + zod
+- 技术栈：Node.js ≥ 20 + TypeScript + Playwright + OpenAI 兼容 LLM（纯提示词工程，原生 fetch）+ js-yaml + zod
+- **实现说明**：初版设计曾计划用 LangGraph.js 编排 Agent，实际实现为**纯提示词工程 + 手写决策循环**（`src/agent/loop.ts`，无任何 Agent 框架依赖）。本文已按实际实现修订表述，架构语义不变（observe → think → act → check 对应 loop 内的感知 → 决策 → 执行 → 恢复点检查）。
 
 ---
 
@@ -14,14 +15,17 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  CLI 层（commander）                                             │
-│  pbagent run / validate / draft / report / rollback              │
+│  pbagent run / validate / chat / versions / auth                 │
 ├─────────────────────────────────────────────────────────────────┤
 │  编排层（Orchestrator）—— 三态运行模型的核心                      │
 │  ┌───────────┐   失败    ┌──────────────┐   完成   ┌──────────┐ │
 │  │ Playbook  │ ───────→ │ LLM Agent    │ ───────→ │ 沉淀器   │ │
-│  │ 执行引擎  │ ←─────── │ 兜底(LangGraph│          │ Learning │ │
-│  │ (STATE A) │  恢复点  │ ) (STATE B)  │          │ (STATE C)│ │
+│  │ 执行引擎  │ ←─────── │ 决策循环      │          │ Learning │ │
+│  │ (STATE A) │  恢复点  │ (STATE B)    │          │ (STATE C)│ │
 │  └───────────┘          └──────────────┘          └──────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│  Web 层（src/server + web/）                                     │
+│  会话式控制台 V2 · SSE 实时推送 · 智能路由 · 版本链查询           │
 ├─────────────────────────────────────────────────────────────────┤
 │  能力层                                                          │
 │  ┌─────────┐ ┌─────────┐ ┌──────────┐ ┌─────────┐ ┌──────────┐ │
@@ -30,7 +34,7 @@
 │  └─────────┘ └─────────┘ └──────────┘ └─────────┘ └──────────┘ │
 ├─────────────────────────────────────────────────────────────────┤
 │  基础层                                                          │
-│  Playwright(Chromium) │ VLM API │ 本地文件系统(runs/playbooks/)  │
+│  Playwright(Chromium+stealth) │ LLM API │ 本地文件系统(runs/)    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,17 +43,20 @@
 | 模块 | 职责 | 对应需求 |
 |------|------|----------|
 | cli | 命令解析、参数注入、全局配置 | F-07 |
-| orchestrator | 三态调度（A→B→A→C）、run 生命周期、恢复点回归 | F-04/F-05 |
+| orchestrator（agent/takeover.ts） | 三态调度（A→B→A→C）、run 生命周期、恢复点回归 | F-04/F-05 |
 | playbook | YAML 加载、Schema 校验、include 展开、版本管理 | F-01/F-06 |
 | executor | Playwright 确定性执行、步骤结果写上下文 | F-02 |
 | detector | 4 类失败检测与分类 | F-03 |
 | perception | 截图采集、DOM 压缩序列化 | F-04 |
-| agent | LangGraph 兜底 Agent（视觉+DOM 双通道决策） | F-04 |
+| agent | 决策循环兜底 Agent（纯提示词工程，截图+DOM 双通道） | F-04 |
 | recovery | 恢复点 fingerprint 计算与匹配 | F-05 |
 | learner | Agent 轨迹 → YAML 沉淀、diff 生成 | F-06 |
 | credentials | 凭证加密存储、storageState 复用、脱敏 | F-09 |
 | reporter | 运行报告（JSON+HTML）、成本统计 | F-08 |
-| recorder | 自然语言→Playbook 草稿（录制模式） | F-10 |
+| recorder | 自然语言→Playbook 草稿（录制模式，F-10 待实现） | F-10 |
+| router | 智能路由：自然语言 → 沉淀流程匹配（域名过滤 + LLM 选择） | V2 |
+| server | Web 后端：任务 API + SSE + 会话存储 | V2 |
+| browser | stealth 反检测（UA/WebDriver 指纹擦除） | W10 |
 
 ### 1.3 一次失败自愈的完整时序
 
@@ -78,59 +85,59 @@ Playbook step#7 (click "提交订单") 执行
 pbagent/
 ├── src/
 │   ├── cli/                    # CLI 入口与子命令
-│   │   ├── index.ts
-│   │   ├── run.ts              # pbagent run
-│   │   ├── validate.ts
-│   │   ├── draft.ts
-│   │   └── report.ts
-│   ├── orchestrator/
-│   │   ├── orchestrator.ts     # 三态调度主循环
-│   │   └── types.ts            # RunState / StepResult / 模式枚举
+│   │   ├── index.ts            # 命令注册
+│   │   ├── run.ts              # pbagent run（--takeover/--learn/--headed）
+│   │   ├── validate.ts         # pbagent validate
+│   │   ├── chat.ts             # pbagent chat（自然语言任务）
+│   │   ├── auth.ts             # pbagent auth（凭证管理）
+│   │   └── versions.ts         # versions/promote/rollback/diff 四合一
+│   ├── agent/                  # STATE B：Agent 决策与编排
+│   │   ├── loop.ts             # 感知→决策→执行主循环（纯提示词工程）
+│   │   ├── llm.ts              # LLM 调用层（原生 fetch + CostTracker + extractJson）
+│   │   └── takeover.ts         # A→B→A 混合编排（恢复点回归）
+│   ├── perception/
+│   │   └── snapshot.ts         # 截图 + DOM 压缩序列化（ref 短 ID）
+│   ├── recovery/
+│   │   └── fingerprint.ts      # 恢复点指纹计算与评分匹配
+│   ├── router/
+│   │   └── select.ts           # 智能路由（域名硬过滤 + LLM 选择 + 参数提取）
+│   ├── server/                 # Web 后端
+│   │   ├── index.ts            # 任务/会话/历史/版本链 API + SSE
+│   │   ├── sessions.ts         # 会话存储（web-sessions.json 落盘）
+│   │   ├── history.ts          # 任务历史（web-history.json 落盘）
+│   │   └── playbook-history.ts # 版本链查询 API 支撑
 │   ├── playbook/
-│   │   ├── schema.ts           # zod Schema 定义
-│   │   ├── loader.ts           # YAML 加载 + include 展开 + 循环引用检测
-│   │   ├── versioning.ts       # 版本链 / diff / 回滚
+│   │   ├── schema.ts           # zod Schema 定义（14 种步骤）
+│   │   ├── loader.ts           # YAML 加载 + include 展开 + 插值校验
 │   │   └── examples/           # 示例 Playbook
 │   ├── executor/
-│   │   ├── engine.ts           # 步骤执行循环
-│   │   ├── steps/              # 12 种步骤执行器（每文件一个）
-│   │   │   ├── goto.ts
-│   │   │   ├── click.ts
-│   │   │   ├── fill.ts
-│   │   │   └── ...
-│   │   ├── context.ts          # 上下文对象 + 变量插值
-│   │   └── selector.ts         # 多层 fallback 选择器解析
+│   │   ├── engine.ts           # 步骤执行循环（loop 嵌套展开）
+│   │   ├── steps.ts            # 14 种步骤执行器（单文件集中分发）
+│   │   ├── context.ts          # 上下文对象 + 四作用域插值
+│   │   ├── selector.ts         # 多层 fallback 选择器解析
+│   │   └── relogin.ts          # 被踢自动重登
 │   ├── detector/
-│   │   └── failure.ts          # E1-E4 分类
-│   ├── perception/
-│   │   ├── screenshot.ts       # 截图（视口/全页，压缩）
-│   │   └── dom.ts              # DOM 压缩序列化
-│   ├── agent/
-│   │   ├── graph.ts            # LangGraph 状态图定义
-│   │   ├── nodes/              # observe / think / act / check 节点
-│   │   ├── tools.ts            # Agent 动作 → Playwright 映射
-│   │   └── guard.ts            # 安全约束（白名单/危险动作/步数上限）
-│   ├── recovery/
-│   │   └── fingerprint.ts      # 恢复点指纹计算与匹配
+│   │   └── failure.ts          # E1-E4+EX 分类
 │   ├── learner/
-│   │   ├── distill.ts          # 轨迹 → YAML 步骤
-│   │   └── differ.ts           # Playbook diff
+│   │   ├── distill.ts          # 轨迹 → YAML 步骤（蒸馏规则）
+│   │   ├── differ.ts           # 步骤级 diff（LCS）
+│   │   └── versioning.ts       # 版本链管理（.versions/）
 │   ├── credentials/
 │   │   ├── store.ts            # AES-256-GCM 加密读写
 │   │   └── session.ts          # storageState 持久化复用
+│   ├── browser/
+│   │   └── stealth.ts          # 反检测（UA 动态生成/WebDriver 指纹擦除）
 │   ├── reporter/
-│   │   ├── json.ts             # 结构化 JSON 报告
-│   │   ├── html.ts             # 单文件 HTML 报告模板
-│   │   └── cost.ts             # 成本统计
+│   │   └── report.ts           # run.json + report.html 单文件生成
 │   └── shared/
-│       ├── config.ts           # 全局配置
-│       └── logger.ts           # 日志（自动脱敏）
-├── test-site/                  # 本地演示站点（见 §12）
-│   ├── server.ts
-│   └── public/
-├── tests/                      # 单测 + E2E
-├── playbooks/                  # 用户 Playbook 库（运行时目录）
-├── runs/                       # 运行产物（运行时目录）
+│       └── redact.ts           # 全链路脱敏
+├── test-site/                  # 本地演示站点（改版模拟/踢下线）
+│   └── server.ts
+├── tests/                      # 单测 + E2E（21 文件 114 用例）
+├── web/                        # Vue3 控制台 V2（会话式交互）
+│   └── src/components/         # Sidebar/HomeView/SessionView/MessageTask/SettingsPanel
+├── playbooks/                  # 用户 Playbook 库 + .versions/ 版本链（运行时目录）
+├── runs/                       # 运行产物 + web-sessions.json + web-history.json（运行时目录）
 ├── credentials/                # 加密凭证（运行时目录）
 └── package.json
 ```
@@ -347,9 +354,12 @@ E2 的 pre-flight 是「不等满超时」的关键：在 `waitFor` 的同时并
 
 ---
 
-## 5. 兜底 Agent 设计（LangGraph）
+## 5. 兜底 Agent 设计（纯提示词工程）
 
-### 5.1 状态图
+> 实现说明：初版设计为 LangGraph 状态图，实际落地为**手写决策循环**（`src/agent/loop.ts`，~530 行，无框架依赖）。
+> 循环节点语义与下图一一对应：observe=snapshot()、think=chat() 单轮决策、act=动作执行器、check=onAfterAction 恢复点钩子。
+
+### 5.1 决策循环
 
 ```
             ┌──────────┐
@@ -361,7 +371,7 @@ E2 的 pre-flight 是「不等满超时」的关键：在 `waitFor` 的同时并
           └──────┬──────┘               │
                  ▼                      │
           ┌─────────────┐  否           │
-          │    think    │ (VLM 推理)    │
+          │    think    │ (LLM 推理)    │
           └──────┬──────┘               │
                  ▼                      │
           ┌─────────────┐  动作被 guard 拒 ─→ think 重试(计入步数)
@@ -373,8 +383,8 @@ E2 的 pre-flight 是「不等满超时」的关键：在 `waitFor` 的同时并
           └─────────────┘
 ```
 
-- LangGraph 节点：`observe → think → act → check` 循环，`check` 内做恢复点匹配 + 步数/预算检查
-- checkpoint：LangGraph MemorySaver 每 Agent 步存档，run 结束丢弃（不跨 run 复用，简化 v1）
+- 循环节点：`observe → think → act → check` 循环，`check` 内做恢复点匹配 + 步数/预算检查
+- 每步状态即 `AgentStep` 对象（step/url/action/ok/screenshot/engine），轨迹天然可回放；无跨 run checkpoint（run 结束即弃，简化 v1）
 
 ### 5.2 感知输入（perception）
 
@@ -386,7 +396,7 @@ E2 的 pre-flight 是「不等满超时」的关键：在 `waitFor` 的同时并
 - 只序列化**可见**元素：`display/visibility/opacity` 过滤
 - 每个候选元素输出一行：`[k23] button "确认下单" (可见, 可点击, 坐标~(640,512))`
 - 上限 300 个元素 / 8KB 文本，超限按「可交互优先 + 视口内优先」截断
-- 元素带短 ID（k23），think 输出动作时直接引用 ID，act 映射回真实 locator——**避免 VLM 输出坐标漂移问题**
+- 元素带短 ID（k23），think 输出动作时直接引用 ID，act 映射回真实 locator——**避免视觉模型输出坐标漂移问题**
 
 ### 5.3 think 节点 Prompt 骨架
 
@@ -406,36 +416,38 @@ E2 的 pre-flight 是「不等满超时」的关键：在 `waitFor` 的同时并
 
 ## 输出格式(JSON)
 {"thought": "一句话推理",
- "action": "click|fill|press|back|scroll|wait|goto|done|giveup",
- "target": "元素ID 或 URL", "value": "fill 时的值"}
+ "action": "click|fill|press|drag|goto|wait|done|fail",
+ "target": "元素ref 或 URL", "value": "fill 时的值", "dx/dy": "drag 位移"}
 ```
 
-约束：temperature=0；输出 JSON Schema 约束；`done` 表示任务已达成（后面没有可回归的步骤时用）、`giveup` 表示判断无法完成。
+约束：temperature=0；请求侧 jsonMode + 解析侧兼容（DSML/双 JSON/围栏）+ 失败带坏输出纠错重试（最多 3 次）；`done` 表示任务已达成、`fail` 表示判断无法完成。
 
 ### 5.4 act → Playwright 映射与 guard
 
 | Agent 动作 | Playwright 调用 | guard 规则 |
 |-----------|-----------------|-----------|
-| click(k) | locator.click() | 目标元素所在 frame 的 URL 域名必须在 allowDomains |
-| fill(k, v) | locator.fill(v) | 同上；值经脱敏管道 |
+| click(ref) | locator.click() | 目标元素所在 frame 的 URL 域名必须在 allowDomains |
+| fill(ref, v) | locator.fill(v) | 同上；值经脱敏管道 |
 | press(key) | page.keyboard.press() | key 白名单（Enter/Escape/Tab/Arrow*） |
-| back / scroll / wait | 对应 page API | 无 |
+| drag(ref, dx, dy) | mouse.move+down+up（ease-out 曲线+抖动） | 域名白名单；不进蒸馏（反爬对抗非业务流程） |
 | goto(url) | page.goto() | url 域名必须在 allowDomains |
-| done / giveup | 结束接管 | 无 |
+| wait(ms) | page.waitForTimeout | 无 |
+| done / fail | 结束接管 | 无 |
 
 guard 三条硬规则（PRD F-04 安全约束）：
 1. **域名白名单**：任何导航/提交动作目标域名 ∉ allowDomains → 拒绝，记入轨迹
 2. **危险动作拒绝**：click 目标元素匹配危险特征（文本含 删除/支付/清空/deactivate，或 button[type=submit] 且上下文为删除确认）→ 无人值守模式直接拒绝
 3. **步数与预算双上限**：默认 15 步 / 单次接管 LLM 花费上限 $0.10，任一超限 → END(exhausted)
 
-### 5.5 VLM 配置
+### 5.5 LLM 配置（OpenAI 兼容）
 
 ```typescript
-const vlm = {
-  primary: { model: 'qwen-vl-max', baseUrl: 'https://dashscope.aliyuncs.com/...' },
-  fallback: { model: 'gpt-4o' },
-};
-// 主模型连续 2 次超时/格式错误 → 切 fallback；cost 统计按实际使用模型计价
+// .env：PBA_LLM_BASE_URL / PBA_LLM_API_KEY / PBA_LLM_MODEL
+// 实现见 src/agent/llm.ts：原生 fetch 调 OpenAI 兼容 /chat/completions，
+// CostTracker 按模型单价表折算 USD，请求级 overrides 支持 Web 端用户自带 Key（不落盘）。
+// 选型硬约束：所选模型必须支持图像输入（截图双通道决策依赖）——
+// 实测 deepseek-flash 可用；deepseek-v4-pro 纯文本模型不可用。
+// 模型自动降级链（qwen → glm → deepseek）为 v1.x 候选，当前单模型。
 ```
 
 ---
@@ -510,7 +522,7 @@ playbooks/
 
 ```
 pbagent draft "在演示后台把 SKU S001 的价格改成 99"
-  → LLM-1（纯文本规划，非 VLM）：生成 Playbook 草稿（含猜测的 selector）
+  → LLM-1（纯文本规划）：生成 Playbook 草稿（含猜测的 selector）
   → 试跑草稿（onFailure=takeover，Agent 边修边记）
   → 全程记录成功路径
   → learner 沉淀为正式 Playbook
@@ -551,7 +563,7 @@ runs/
 ### 9.3 脱敏管道
 
 - logger/reporter 序列化任何对象前过一遍 redact：key ∈ `sensitive` 列表或匹配 /(password|token|secret|cookie)/i → 值替换 `***`
-- Agent 的 think 输入中 fill 值同样脱敏（VLM 不需要看到真实密码，只需要知道「此处填入了凭证」）
+- Agent 的 think 输入中 fill 值同样脱敏（LLM 不需要看到真实密码，只需要知道「此处填入了凭证」）
 
 ---
 
@@ -590,7 +602,7 @@ runs/
 }
 ```
 
-成本统计：每次 VLM 调用记录 tokens → 按模型单价表（config 可更新）折算 USD；Playbook 模式自然为 0 调用 $0。
+成本统计：每次 LLM 调用记录 tokens → 按模型单价表（config 可更新）折算 USD；Playbook 模式自然为 0 调用 $0。
 
 ---
 
@@ -631,8 +643,8 @@ pbagent cost <runId>                        # 打印成本明细
 |----|------|----------|
 | 单测 | schema/loader/selector/context/fingerprint/cost | 10 类非法 YAML 报错、include 循环引用、插值缺变量、fallback 全层失败、fingerprint 并列取小 |
 | 集成 | executor × test-site（无 LLM） | 12 步骤类型逐个跑通、E1-E4 分类正确性、连续 10 次结果一致 |
-| E2E（mock VLM） | orchestrator × test-site × Agent | mock think 返回固定动作序列：接管→恢复→回归全链路（CI 不烧钱） |
-| E2E（真 VLM） | 同上 + Qwen-VL | 每晚定时跑 3 个改版场景，统计自愈率（打真实指标） |
+| E2E（mock LLM） | orchestrator × test-site × Agent | mock think 返回固定动作序列：接管→恢复→回归全链路（CI 不烧钱） |
+| E2E（真 LLM） | 同上 + deepseek-flash | 每晚定时跑 3 个改版场景，统计自愈率（打真实指标） |
 
 ---
 
@@ -644,10 +656,10 @@ pbagent cost <runId>                        # 打印成本明细
 | W2 | 执行引擎 + 失败检测 | 12 步骤执行器、E1-E4 分类、上下文插值、test-site v1 |
 | W3 | 报告 + 参数化 + 循环 | run.json/report.html、--params、loop 步骤、50 SKU 批量用例 |
 | W4 | **MVP**：CLI 完整可用 | 凭证管理（脱敏+加密）、session 复用、内部试用开始 |
-| W5 | 感知器 + Agent 骨架 | perception（截图+DOM 压缩）、LangGraph 图、guard |
-| W6 | 恢复点 + 回归 | fingerprint 匹配、回归续跑、E2E(mock VLM) 全链路 |
+| W5 | 感知器 + Agent 骨架 | perception（截图+DOM 压缩）、决策循环、guard |
+| W6 | 恢复点 + 回归 | fingerprint 匹配、回归续跑、E2E(mock LLM) 全链路 |
 | W7 | 沉淀 + 版本管理 | 轨迹→YAML、diff、promote/rollback |
-| W8 | **v1.0**：真 VLM 联调 + 演示资产 | 自愈率达标、成本统计、演示站点改版脚本、分享素材 |
+| W8 | **v1.0**：真 LLM 联调 + 演示资产 | 自愈率达标、成本统计、演示站点改版脚本、分享素材 |
 
 W4 与 W8 是两个可对外演示的检查点。
 
@@ -658,11 +670,11 @@ W4 与 W8 是两个可对外演示的检查点。
 | # | 风险 | 影响 | 对策 |
 |---|------|------|------|
 | 1 | DOM 压缩后信息不足，Agent 找不到目标 | 自愈率掉 | 双通道兜底：DOM 给 ID + 截图给视觉；元素上限 300 可调；think 可主动请求 scroll |
-| 2 | VLM 输出格式漂移（非 JSON） | 动作解析失败 | temperature=0 + JSON Schema 约束 + 一次重试 + 换 fallback 模型 |
+| 2 | LLM 输出格式漂移（非 JSON） | 动作解析失败 | temperature=0 + JSON Schema 约束 + 一次重试 + 换 fallback 模型 |
 | 3 | 恢复点误匹配（提前回归到错误步骤） | 静默数据错误 | score 阈值 50 + 唯一最高分才回归 + 窗口 5 步限制 |
 | 4 | A↔B 死循环（回归后马上又失败） | 成本失控 | 单 run 接管次数上限 3 + 单次接管预算 $0.10 |
 | 5 | 沉淀的 YAML 把动态值写死 | v2 二次运行失败 | 沉淀时动态段（订单号/时间戳/ID）强制替换回 `${ctx.*}` 插值 |
-| 6 | 敏感信息进 VLM 上下文 | 泄露风险 | 脱敏管道前置：fill 值进 prompt 前替换占位符 |
+| 6 | 敏感信息进 LLM 上下文 | 泄露风险 | 脱敏管道前置：fill 值进 prompt 前替换占位符 |
 | 7 | Playwright 元素自动等待与自定义超时打架 | 误报超时 | 统一在 selector.resolve 收口，禁止裸 locator 调用 |
 | 8 | 真实网站反爬（验证码/风控） | 场景受限 | v1 明确不支持验证码场景，文档声明边界；P2 评估打码服务 |
 

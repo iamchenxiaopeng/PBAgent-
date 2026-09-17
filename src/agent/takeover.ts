@@ -3,7 +3,7 @@ import type { Playbook, Step } from '../playbook/schema.js';
 import { runPlaybookSteps, type RunTrace, type StepTrace } from '../executor/engine.js';
 import { StepFailure } from '../detector/failure.js';
 import { snapshot } from '../perception/snapshot.js';
-import { runAgent, type AgentResult } from './loop.js';
+import { runAgent, type AgentResult, type AgentStep } from './loop.js';
 import { buildRecoveryPoints, checkRecovery, matchContextOf } from '../recovery/fingerprint.js';
 import { distillFromTakeover, type DistillResult } from '../learner/distill.js';
 
@@ -23,7 +23,7 @@ export interface TakeoverOptions {
   allowDomains: string[];
   /** Agent 兜底步数上限（默认 15） */
   agentMaxSteps?: number;
-  /** 是否携带截图给 VLM */
+  /** 是否携带截图给 LLM */
   withScreenshot?: boolean;
   /** STATE C：兜底成功后蒸馏为新版本 Playbook（写入 .versions/ 草稿；主文件不动） */
   learn?: {
@@ -31,6 +31,14 @@ export interface TakeoverOptions {
     mainFile: string;
     runId?: string;
   };
+  /** Agent 兜底每步回调（Web 端推 SSE 时间线用） */
+  onAgentStep?: (step: AgentStep) => void;
+  /** 断点续跑每步回调（Web 端推 SSE 时间线用） */
+  onRetryStep?: (trace: StepTrace) => void;
+  /** LLM 请求级覆盖（Web 端用户自带 key） */
+  llmOverrides?: Partial<{ baseUrl: string; apiKey: string; model: string }>;
+  /** 外部停止请求（返回 true 终止 Agent 循环；每轮 LLM 调用前轮询） */
+  shouldStop?: () => boolean;
   /** 日志 */
   log?: (msg: string) => void;
 }
@@ -49,6 +57,8 @@ export interface HybridResult {
   success: boolean;
   /** STATE C 蒸馏产物（learn 开启且兜底成功时有值） */
   learned?: DistillResult;
+  /** 沉淀草稿版本号（写盘成功后有值；调用方展示用） */
+  learnedVersion?: number;
 }
 
 /** 从失败步骤推导 Agent 任务目标（给 LLM 的任务描述） */
@@ -92,6 +102,9 @@ async function agentLoopWithRecovery(
     allowDomains: options.allowDomains,
     maxSteps: options.agentMaxSteps ?? 15,
     withScreenshot: options.withScreenshot ?? true,
+    llmOverrides: options.llmOverrides,
+    shouldStop: options.shouldStop,
+    onStep: options.onAgentStep,
     log,
     // 每步动作后检查恢复点（复用该步已感知的数据不精确——重新快照 <200ms）
     onAfterAction: async (p) => {
@@ -121,37 +134,52 @@ export async function runWithTakeover(
   params: Record<string, unknown>,
   options: TakeoverOptions,
 ): Promise<HybridResult> {
-  const log = options.log ?? (() => {});
-  const timeline: HybridResult['timeline'] = [];
-
-  // STATE A：首跑
   let firstTrace: RunTrace;
   let failure: StepFailure | undefined;
-  let failedIndex = -1;
   try {
     firstTrace = await runPlaybookSteps(page, playbook, params);
-    timeline.push({ phase: 'A', from: 0, to: firstTrace.steps.length, note: 'Playbook 全程成功' });
     return {
       trace: firstTrace,
       agent: null,
       failedIndex: -1,
       resumedIndex: null,
-      timeline,
+      timeline: [{ phase: 'A', from: 0, to: firstTrace.steps.length, note: 'Playbook 全程成功' }],
       success: true,
     };
   } catch (err) {
     failure = err instanceof StepFailure ? err : undefined;
     firstTrace = (err as { __trace?: RunTrace }).__trace ?? emptyTrace(playbook.name);
-    // 找失败步骤在展开数组中的下标（trace 的最后失败步）
+    if (!failure) throw err;
+  }
+  return resumeWithTakeover(page, playbook, params, firstTrace, failure, options);
+}
+
+/**
+ * 从失败现场接管的混合执行（STATE B → A，可选 STATE C）。
+ * 适用场景：调用方已经跑过 STATE A 首跑并拿到失败（如 Web 端逐步推 SSE 的首跑），
+ * 传入失败 trace 与异常，直接从 Agent 兜底开始——不从头的重跑。
+ */
+export async function resumeWithTakeover(
+  page: Page,
+  playbook: Playbook,
+  params: Record<string, unknown>,
+  firstTrace: RunTrace,
+  failure: StepFailure,
+  options: TakeoverOptions,
+): Promise<HybridResult> {
+  const log = options.log ?? (() => {});
+  const timeline: HybridResult['timeline'] = [
+    { phase: 'A', from: 0, to: firstTrace.steps.length, note: `步骤失败：${failure.message.slice(0, 80)}` },
+  ];
+
+  // 找失败步骤在展开数组中的下标（trace 的最后失败步；loop 内步骤用步骤名匹配兜底）
+  let failedIndex = playbook.steps.findIndex((s) => s.name === failure.step?.name);
+  if (failedIndex < 0) {
     const failedStepId = [...firstTrace.steps].reverse().find((s) => s.status === 'failed')?.stepId;
-    // loop 内步骤不在顶层数组——用步骤名匹配兜底
-    failedIndex = playbook.steps.findIndex((s) => s.name === failure?.step?.name);
-    if (failedIndex < 0 && failedStepId) {
+    if (failedStepId) {
       const n = Number(String(failedStepId).replace(/^s/, ''));
       if (!Number.isNaN(n)) failedIndex = n - 1;
     }
-    timeline.push({ phase: 'A', from: 0, to: firstTrace.steps.length, note: `步骤失败：${failure?.message.slice(0, 80)}` });
-    if (!failure) throw err;
   }
 
   // EX 配置错误不接管（与 relogin 同口径）
@@ -202,7 +230,12 @@ export async function runWithTakeover(
   let retryTrace: RunTrace;
   let hybridResult: HybridResult;
   try {
-    retryTrace = await runPlaybookSteps(page, { ...playbook, steps: rest }, params);
+    retryTrace = await runPlaybookSteps(
+      page,
+      { ...playbook, steps: rest },
+      params,
+      options.onRetryStep ? { onStepStart: (st) => options.onRetryStep!(st) } : {},
+    );
     timeline.push({ phase: 'A', from: resumedIndex + 1, to: playbook.steps.length, note: '断点续跑成功' });
     // 合并 trace：首跑（含失败步）+ skipped 标记 + Agent 轨迹摘要 + 续跑
     const agentMark: StepTrace = {
@@ -267,7 +300,7 @@ export async function maybeLearn(
     });
     log(`  📝 版本草稿已写入：v${saved.newVersion}（未生效；pbagent promote 确认后替换主文件）`);
     log(`     diff: ${saved.diffFile}`);
-    return { ...hybrid, learned };
+    return { ...hybrid, learned, learnedVersion: saved.newVersion };
   } catch (e) {
     log(`  ⚠ 沉淀失败（不影响运行结果）: ${(e as Error).message}`);
     return hybrid;

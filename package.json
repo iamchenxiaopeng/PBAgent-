@@ -1,6 +1,6 @@
 {
   "name": "pbagent",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "description": "Playbook + LLM hybrid browser automation agent",
   "type": "module",
   "bin": {
@@ -14,6 +14,7 @@
     "dev": "tsx src/cli/index.ts",
     "cli": "tsx src/cli/index.ts",
     "server": "tsx src/server/index.ts",
+    "dev:site": "tsx test-site/server.ts",
     "web": "cd web && ../node_modules/vite/bin/vite.js",
     "web:server": "concurrently \"npm:server\" \"npm:web\" || (npm run server & cd web && ../node_modules/vite/bin/vite.js)"
   },
