@@ -224,4 +224,49 @@ for (attempt of 1..3) {
 
 ---
 
-*相关文档：[PRD](PRD.md)｜[DESIGN](DESIGN.md)｜[SHARING（29 踩坑实录）](SHARING.md)｜[MVP-ACCEPTANCE](MVP-ACCEPTANCE.md)｜[演示：A→B→A→C 时间线](assets/abac-timeline.html)｜[README](../README.md)*
+## 11. W12 补记：意图解析层 + 独立蒸馏（沉淀链路补全）
+
+### 11.1 起因
+
+一次架构答疑：老板质疑"沉淀为什么必须满足四个条件"，并给出他的设想——**成功就蒸馏，下次用 LLM 判断是否命中，命中就走沉淀**。追问过程中他还否掉了我提的 `hybrid` 路由策略（"换个语义还是无法正确执行，这策略意义何在"）。
+
+两个追问都成立，最终收敛成一次架构补全。
+
+### 11.2 三个关键决策
+
+| 决策 | 结论 | 理由 |
+|---|---|---|
+| 路由策略档位 | **砍掉 hybrid，只留 deterministic / intent** | 维度混淆：候选数量只影响解析成本，有无自由文本才决定是否需要语义理解。修正后默认值跟着入口走，用户不需要理解"策略" |
+| 怎么省 token | **意图结果缓存，不是跳过解析** | 跳过解析 = 读不懂语义 = 回到原始问题。缓存 key = 归一化任务 + 域名，高频重复场景命中率接近 100% |
+| 误命中风险 | **置信度阈值 + 执行后成功断言** | 安全模型从 fail-safe（误判→Agent 兜底→多花钱）变成 fail-dangerous（误判→静默执行错流程），必须补 |
+
+### 11.3 实现
+
+| 模块 | 职责 |
+|---|---|
+| `src/learner/draft.ts` | F-10 独立蒸馏：Agent 成功轨迹 → 全新 Playbook（自带 baseUrl/allowDomains/起始 goto/末尾成功断言），支持 LLM 语义化参数命名 |
+| `src/router/intent.ts` | 意图解析层：一次 LLM 调用完成「选流程 + 抽参数 + 自评置信度」，含结果缓存（FIFO 200 条）与阈值判定（<0.7 走 Agent） |
+| `server/index.ts` | `learnMode`（off/on-failure/on-success）+ `routeMode`（deterministic/intent），`/api/match?mode=intent` |
+| Web | 主页与会话页：「失败自动沉淀」勾选 → 三档下拉；新增路由模式下拉；命中卡展示置信度与自动提取的参数 |
+
+成功断言的实现取巧但有效：**沉淀时在末尾追加一个 `assert` 步骤**记录终态 URL path，下次执行不符 → assert 失败 → Playbook 整体失败 → **已有的 A→B 兜底机制自动接管**。零新增机制，复用现成链路。
+
+### 11.4 成本模型变化
+
+| 场景 | W11 及以前 | W12 intent 模式 |
+|---|---|---|
+| 命中沉淀 | ¥0（但读不懂语义） | ~¥0.002（解析）；命中缓存则 ¥0 |
+| 未命中 | Agent N 步 ≈ 6600 tokens | 同左 + 解析开销 |
+| 沉淀覆盖范围 | 单个 Playbook 的单步骤 | 任何 Agent 跑通的任务，跨流程复用 |
+
+净省约 75%（省掉多轮感知循环，只付 1 次解析），换来的是跨流程复用与自然语言参数提取。
+
+### 11.5 遗留
+
+1. **独立轨迹库仍未建** —— 当前 `on-success` 沉淀直接写 `playbooks/` 主目录（立即可用，闭环可见），但产物仍与 Playbook 绑定，不是可独立检索的"轨迹"实体
+2. **向量召回未接** —— 候选多时 prompt 会变长；`select.ts` 注释里预留的"候选 >200 条接向量召回"仍然空着
+3. **成功断言只用 URL path** —— 未记录关键文本；终态未发生跳转的任务（如纯表单提交）拿不到有效断言
+
+---
+
+*相关文档：[PRD](PRD.md)｜[DESIGN](DESIGN.md)｜[SHARING（30 踩坑实录）](SHARING.md)｜[MVP-ACCEPTANCE](MVP-ACCEPTANCE.md)｜[演示：A→B→A→C 时间线](assets/abac-timeline.html)｜[README](../README.md)*

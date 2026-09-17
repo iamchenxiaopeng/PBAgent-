@@ -47,11 +47,16 @@ const load = async () => {
 onMounted(load);
 
 /** 设置里的 LLM 默认值（与 HomeView 同源） */
-const defaults = reactive({});
+const defaults = reactive({ learnMode: 'on-failure', routeMode: 'intent' });
 try {
   const raw = localStorage.getItem('pbagent-settings');
   if (raw) Object.assign(defaults, JSON.parse(raw));
 } catch { /* 忽略 */ }
+// 旧版本 learn:boolean 迁移
+if (defaults.learnMode === undefined) {
+  defaults.learnMode = defaults.learn === false ? 'off' : 'on-failure';
+}
+if (defaults.routeMode === undefined) defaults.routeMode = 'intent';
 
 const llmBody = () => {
   const o = {};
@@ -79,6 +84,8 @@ const send = async () => {
         task: text,
         maxSteps: defaults.maxSteps ?? null,
         headed: Boolean(defaults.headed),
+        learnMode: defaults.learnMode || 'on-failure',
+        routeMode: defaults.routeMode || 'intent',
         sessionId: props.session.id,
         ...llmBody(),
       }),

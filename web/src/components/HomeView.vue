@@ -5,12 +5,28 @@ const props = defineProps({ health: Object });
 const emit = defineEmits(['session-started', 'sessions-changed']);
 
 /** 设置里持久化的默认值（SettingsPanel 写 localStorage） */
-const defaults = reactive({ headed: false, maxSteps: null, baseUrl: '', apiKey: '', model: '' });
+const defaults = reactive({
+  headed: false,
+  maxSteps: null,
+  baseUrl: '',
+  apiKey: '',
+  model: '',
+  /** 沉淀档位：off / on-failure（兜底成功沉淀版本）/ on-success（Agent 成功即新建 Playbook） */
+  learnMode: 'on-failure',
+  /** 路由模式：intent（每次 LLM 解析意图+参数）/ deterministic（按域名直选，零成本） */
+  routeMode: 'intent',
+});
 const loadDefaults = () => {
   try {
     const raw = localStorage.getItem('pbagent-settings');
     if (raw) Object.assign(defaults, JSON.parse(raw));
   } catch { /* 忽略 */ }
+  // 旧版本 learn:boolean 迁移（true → on-failure；false → off）
+  if (defaults.routeMode === undefined) defaults.routeMode = 'intent';
+  if (defaults.learnMode === undefined) {
+    defaults.learnMode = defaults.learn === false ? 'off' : 'on-failure';
+  }
+  delete defaults.learn;
 };
 onMounted(loadDefaults);
 
@@ -55,6 +71,8 @@ const buildBody = () => ({
   task: task.value.trim(),
   maxSteps: defaults.maxSteps ?? null,
   headed: Boolean(defaults.headed),
+  learnMode: defaults.learnMode || 'on-failure',
+  routeMode: defaults.routeMode || 'intent',
   ...llmBody(),
 });
 
@@ -69,6 +87,7 @@ const submit = async () => {
   matchHit.value = null;
   paramError.value = '';
   error.value = '';
+  for (const k of Object.keys(paramValues)) delete paramValues[k];
   try {
     // 1. 建会话（首条指令作标题）
     const sResp = await fetch('/api/sessions', {
@@ -85,16 +104,31 @@ const submit = async () => {
       const mResp = await fetch('/api/match', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ task: body.task, url: body.url, llm: body.llm }),
+        body: JSON.stringify({ task: body.task, url: body.url, llm: body.llm, mode: body.routeMode }),
       });
       if (mResp.ok) {
         const m = await mResp.json();
         if (m.matched && m.playbook) {
-          for (const p of m.playbook.params || []) {
+          // intent 模式：参数已由 LLM 从任务描述里提取好，直接预填（确定性模式没有这层）
+          if (m.params && Object.keys(m.params).length) {
+            for (const [k, v] of Object.entries(m.params)) paramValues[k] = String(v ?? '');
+          }
+          const params =
+            m.params && Object.keys(m.params).length ? Object.keys(m.params) : m.playbook.params || [];
+          for (const p of params) {
+            if (String(paramValues[p] ?? '').trim()) continue;
             const m2 = task.value.match(new RegExp(`${p}\\s*[是为=:：]?\\s*([\\w.\\-]+)`, 'i'));
             paramValues[p] = m2 ? m2[1] : '';
           }
-          matchHit.value = { ...m.playbook, reason: m.reason, body, sessionId: session.id };
+          matchHit.value = {
+            ...m.playbook,
+            reason: m.reason,
+            confidence: m.confidence,
+            fromCache: m.fromCache,
+            params,
+            body,
+            sessionId: session.id,
+          };
           return; // 等用户选择
         }
       }
@@ -202,6 +236,21 @@ const canSubmit = () => Boolean(url.value.trim() && task.value.trim()) && !submi
             <input type="checkbox" v-model="defaults.headed" @change="persistDefaults" />
             <span>有头模式</span>
           </label>
+          <label class="opt-steps" title="路由模式：智能解析=每次调用大模型理解意图并提取参数（能识别语义变化）；确定性=按域名直选，零成本但读不懂语义">
+            <span>路由</span>
+            <select class="input" v-model="defaults.routeMode" @change="persistDefaults">
+              <option value="intent">智能解析</option>
+              <option value="deterministic">确定性</option>
+            </select>
+          </label>
+          <label class="opt-steps" title="沉淀档位：成功即沉淀=Agent 跑通就蒸馏成新 Playbook（下次零成本复用）；失败时沉淀=仅 Playbook 失败兜底成功后沉淀版本草稿；不沉淀=关闭">
+            <span>沉淀</span>
+            <select class="input" v-model="defaults.learnMode" @change="persistDefaults">
+              <option value="on-success">成功即沉淀</option>
+              <option value="on-failure">失败时沉淀</option>
+              <option value="off">不沉淀</option>
+            </select>
+          </label>
           <label class="opt-steps">
             <span>最大步数</span>
             <input
@@ -229,7 +278,11 @@ const canSubmit = () => Boolean(url.value.trim() && task.value.trim()) && !submi
         <span class="match-desc">{{ matchHit.description || '（无描述）' }}</span>
       </div>
       <div class="match-meta">
-        {{ matchHit.stepCount }} 步 · 当前 v{{ matchHit.currentVersion || 1 }} · 匹配理由：{{ matchHit.reason }}
+        {{ matchHit.stepCount }} 步 · 当前 v{{ matchHit.currentVersion || 1 }}
+        <template v-if="matchHit.confidence !== undefined">
+          · 置信度 {{ matchHit.confidence.toFixed(2) }}<span v-if="matchHit.fromCache">（缓存命中，零调用）</span>
+        </template>
+        · {{ matchHit.reason }}
       </div>
 
       <div v-if="matchHit.params && matchHit.params.length" class="param-box">

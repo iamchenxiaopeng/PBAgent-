@@ -14,7 +14,10 @@ import { listAllPlaybookVersions, readVersionDiff } from './playbook-history.js'
 import { selectPlaybook, llmReady } from '../router/select.js';
 import { runPlaybookSteps, type StepTrace, type RunTrace } from '../executor/engine.js';
 import { loadPlaybook } from '../playbook/loader.js';
-import type { StepFailure } from '../detector/failure.js';
+import { resumeWithTakeover } from '../agent/takeover.js';
+import { parseIntent, clearIntentCache, CONFIDENCE_THRESHOLD } from '../router/intent.js';
+import { distillToNewPlaybook, saveDraftPlaybook } from '../learner/draft.js';
+import { StepFailure } from '../detector/failure.js';
 import { join, resolve, sep } from 'node:path';
 
 /**
@@ -41,6 +44,29 @@ interface TaskOptions {
   params?: Record<string, unknown>;
   /** 会话 ID（对话式控制台 V2）：任务归属会话，多轮追问时继承上轮上下文 */
   sessionId?: string;
+  /** @deprecated 用 learnMode 代替；保留只为兼容旧前端（true = on-failure） */
+  learn?: boolean;
+  /**
+   * 沉淀档位：
+   * - off         不沉淀
+   * - on-failure  仅 Playbook 失败兜底成功后沉淀版本草稿（写入 .versions/，不动主文件）
+   * - on-success  Agent 跑成功即蒸馏成一个全新 Playbook（F-10；写入 playbooks/ 立即可用）
+   */
+  learnMode?: 'off' | 'on-failure' | 'on-success';
+  /**
+   * 路由模式：
+   * - deterministic  按域名匹配（单候选直选，不花 LLM）——CLI/显式指定场景
+   * - intent         每次 LLM 解析意图（选流程 + 提取参数 + 置信度）——自然语言入口
+   */
+  routeMode?: 'deterministic' | 'intent';
+  /** 用户原始任务描述（会话模式会往 task 里注入记忆上下文，沉淀时需要原始文本） */
+  originalTask?: string;
+}
+
+/** 解析沉淀档位（旧字段 learn:boolean 兼容 → on-failure） */
+function resolveLearnMode(o: TaskOptions): 'off' | 'on-failure' | 'on-success' {
+  if (o.learnMode) return o.learnMode;
+  return o.learn === false ? 'off' : 'on-failure';
 }
 
 interface QueuedEvent {
@@ -62,7 +88,7 @@ interface TaskRecord {
   result?: {
     success: boolean;
     summary: string;
-    steps: Array<Pick<AgentStep, 'step' | 'url' | 'afterUrl' | 'ok' | 'error' | 'engine' | 'usage'>>;
+    steps: Array<Omit<AgentStep, 'screenshotBase64'>>;
     totalMs: number;
     llmCalls: number;
     cost?: AgentResult['cost'];
@@ -113,12 +139,100 @@ const emit = (task: TaskRecord, type: QueuedEvent['type'], data: unknown): void 
 const slimStep = (s: AgentStep): Omit<AgentStep, 'screenshotBase64'> => {
   const { screenshotBase64: _drop, ...rest } = s;
   return rest;
-};async function executeTask(task: TaskRecord): Promise<void> {
+};
+
+/** 用户自带 LLM key → chat 的 overrides（三处重复逻辑提取；无自带 key 返回 undefined） */
+function llmOverridesOf(options: TaskOptions):
+  | { baseUrl?: string; apiKey?: string; model?: string }
+  | undefined {
+  if (!options.llm) return undefined;
+  const { baseUrl, apiKey, model } = options.llm;
+  if (!baseUrl && !apiKey && !model) return undefined;
+  return {
+    ...(baseUrl ? { baseUrl: baseUrl.replace(/\/$/, '') } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+/**
+ * intent 路由模式：LLM 解析意图（选流程 + 提取参数 + 置信度）。
+ * 命中 → 把 playbookFile/params 写回 options，后续走确定性执行；
+ * 未命中（含置信度低于阈值）→ 保持 Agent 模式。
+ */
+async function resolveIntentAndMaybeRun(task: TaskRecord): Promise<void> {
+  const { options } = task;
+  const dir = join(process.cwd(), 'playbooks');
+  emit(task, 'log', '🧭 意图解析模式：调用大模型解析任务意图…');
+  const intent = await parseIntent(options.task, options.url, dir, {
+    llmOverrides: llmOverridesOf(options),
+  });
+  if (intent.fromCache) {
+    emit(task, 'log', `🧭 命中意图缓存（零调用）：${intent.reason}`);
+  } else {
+    emit(
+      task,
+      'log',
+      `🧭 解析完成：候选 ${intent.candidateCount} 条，置信度 ${intent.confidence.toFixed(2)}（阈值 ${CONFIDENCE_THRESHOLD}）`,
+    );
+  }
+  if (!intent.matched || !intent.playbookFile) {
+    emit(task, 'log', `🧭 ${intent.reason} → 走 Agent 感知模式`);
+    return;
+  }
+  const keys = Object.keys(intent.params);
+  emit(
+    task,
+    'log',
+    `🎯 命中沉淀流程《${intent.playbookName}》置信度 ${intent.confidence.toFixed(2)}` +
+      (keys.length ? `，参数 ${keys.map((k) => `${k}=${String(intent.params[k])}`).join('、')}` : ''),
+  );
+  options.playbookFile = intent.playbookFile;
+  options.params = intent.params;
+}
+
+/** on-success 档：Agent 跑成功 → 蒸馏成全新 Playbook（F-10）。失败不影响本次结果 */
+async function maybeAutoDraft(
+  task: TaskRecord,
+  agent: AgentResult,
+  overrides?: { baseUrl?: string; apiKey?: string; model?: string },
+): Promise<void> {
+  if (resolveLearnMode(task.options) !== 'on-success') return;
+  try {
+    const draft = await distillToNewPlaybook(agent, {
+      task: task.options.originalTask ?? task.options.task,
+      url: task.options.url,
+      llmOverrides: overrides,
+      runId: task.id,
+    });
+    const saved = saveDraftPlaybook(join(process.cwd(), 'playbooks'), draft, {
+      runId: task.id,
+      reason: `Agent ${agent.steps.length} 步成功`,
+    });
+    clearIntentCache(); // 新沉淀要能被后续任务立刻检索到
+    emit(
+      task,
+      'log',
+      `📝 自动沉淀《${saved.name}》${draft.stepCount} 步` +
+        `${draft.assertAdded ? ' + 成功断言' : ''}` +
+        `${draft.paramKeys.length ? `，参数 ${draft.paramKeys.join('、')}` : ''}`,
+    );
+    emit(task, 'log', `   → ${saved.file}（下次同任务可直接命中，零 LLM 执行）`);
+  } catch (e) {
+    emit(task, 'log', `⚠ 自动沉淀失败（不影响本次结果）：${(e as Error).message.slice(0, 80)}`);
+  }
+}
+
+async function executeTask(task: TaskRecord): Promise<void> {
   const { options } = task;
   const browserInstance = await getBrowser(Boolean(options.headed));
   const context = await newStealthContext(browserInstance);
   const page = await context.newPage();
   try {
+    // intent 模式：先解析意图（未显式指定 playbookFile 时生效）
+    if (options.routeMode === 'intent' && !options.playbookFile) {
+      await resolveIntentAndMaybeRun(task);
+    }
     // 命中沉淀流程：Playbook 确定性执行（零 LLM）
     if (options.playbookFile) {
       await executePlaybookTask(task, page);
@@ -127,13 +241,7 @@ const slimStep = (s: AgentStep): Omit<AgentStep, 'screenshotBase64'> => {
     await page.goto(options.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     emit(task, 'log', `已打开起始页面：${options.url}${options.headed ? '（有头模式——可在弹出的浏览器窗口中观看）' : ''}`);
 
-    const overrides = options.llm && (options.llm.baseUrl || options.llm.apiKey || options.llm.model)
-      ? {
-          ...(options.llm.baseUrl ? { baseUrl: options.llm.baseUrl.replace(/\/$/, '') } : {}),
-          ...(options.llm.apiKey ? { apiKey: options.llm.apiKey } : {}),
-          ...(options.llm.model ? { model: options.llm.model } : {}),
-        }
-      : undefined;
+    const overrides = llmOverridesOf(options);
 
     const result = await runAgent(page, {
       task: options.task,
@@ -147,6 +255,9 @@ const slimStep = (s: AgentStep): Omit<AgentStep, 'screenshotBase64'> => {
       },
       log: (msg) => emit(task, 'log', msg.replace(/^\s+/, '')),
     });
+
+    // 自动沉淀（on-success 档）——放在 done 事件之前，保证前端日志能看到
+    if (result.success) await maybeAutoDraft(task, result, overrides);
 
     task.result = {
       success: result.success,
@@ -168,7 +279,7 @@ const slimStep = (s: AgentStep): Omit<AgentStep, 'screenshotBase64'> => {
   }
 }
 
-/** 命中沉淀流程的确定性执行（STATE A，零 LLM）——步骤走 SSE 推送，复用前端时间线 */
+/** 命中沉淀流程的确定性执行（STATE A，零 LLM）——失败时 LLM 已配置则 Agent 兜底（A→B→A） */
 async function executePlaybookTask(task: TaskRecord, page: import('playwright').Page): Promise<void> {
   const { options } = task;
   emit(task, 'log', `⚡ 沉淀流程模式：${options.playbookFile}（确定性执行，零 LLM 成本）`);
@@ -187,6 +298,13 @@ async function executePlaybookTask(task: TaskRecord, page: import('playwright').
     perceptionMs: st.ms,
     execMs: st.ms,
   });
+  const llmOverrides = options.llm && (options.llm.baseUrl || options.llm.apiKey || options.llm.model)
+    ? {
+        ...(options.llm.baseUrl ? { baseUrl: options.llm.baseUrl.replace(/\/$/, '') } : {}),
+        ...(options.llm.apiKey ? { apiKey: options.llm.apiKey } : {}),
+        ...(options.llm.model ? { model: options.llm.model } : {}),
+      }
+    : undefined;
   try {
     const r = loadPlaybook(resolve(options.playbookFile ?? ''));
     if (!r.ok || !r.playbook) {
@@ -218,15 +336,103 @@ async function executePlaybookTask(task: TaskRecord, page: import('playwright').
     emit(task, 'done', task.result);
     writeHistory(task, stepsOut);
   } catch (e) {
-    // StepFailure 携带已执行部分——补推给前端时间线（含失败那步，跳过已推送的）
-    const partial = (e as StepFailure & { __trace?: RunTrace }).__trace;
+    const err = e as StepFailure & { __trace?: RunTrace };
+    const partial = err.__trace;
     if (partial) {
       partial.steps.forEach((st, i) => {
         if (i >= emitted) emit(task, 'step', slimStep(toStep(st, i)));
       });
-    }    task.status = 'error';
-    emit(task, 'error', { message: `沉淀流程执行出错: ${(e as Error).message}` });
+      emitted = partial.steps.length;
+    }
+    // LLM 已配置且非 EX 配置错误 → Agent 兜底（A→B→A 闭环）
+    const takeoverOk = err instanceof StepFailure && err.kind !== 'EX' && (llmReady() || Boolean(llmOverrides));
+    if (takeoverOk && partial) {
+      await takeoverFailedPlaybook(task, page, partial, err, { emitted, toStep, startedAt, llmOverrides });
+      return;
+    }
+    task.status = 'error';
+    emit(task, 'error', { message: `沉淀流程执行出错: ${err.message}` });
     writeHistory(task, partial ? partial.steps.map((st, i) => slimStep(toStep(st, i))) : []);
+  }
+}
+
+/**
+ * Playbook 失败后的 Agent 兜底（STATE B）+ 恢复点续跑（STATE A）。
+ * B 段 Agent 步骤与 A 段续跑步骤实时推 SSE，前端时间线完整呈现 A→B→A。
+ */
+async function takeoverFailedPlaybook(
+  task: TaskRecord,
+  page: import('playwright').Page,
+  firstTrace: RunTrace,
+  failure: StepFailure,
+  ctx: {
+    emitted: number;
+    toStep: (st: StepTrace, i: number) => AgentStep;
+    startedAt: number;
+    llmOverrides?: { baseUrl?: string; apiKey?: string; model?: string };
+  },
+): Promise<void> {
+  const { options } = task;
+  const r = loadPlaybook(resolve(options.playbookFile ?? ''));
+  const pb = r.ok && r.playbook ? r.playbook : null;
+  if (!pb) {
+    task.status = 'error';
+    emit(task, 'error', { message: `兜底前 Playbook 重新加载失败: ${failure.message}` });
+    writeHistory(task, firstTrace.steps.map((st, i) => slimStep(ctx.toStep(st, i))));
+    return;
+  }
+  emit(task, 'log', `⚠ [${failure.kind} ${failure.kindLabel}] 触发 Agent 兜底接管（A→B→A）`);
+
+  let agentStepBase = ctx.emitted; // B 段步骤编号接在 A 段之后
+  const hybrid = await resumeWithTakeover(page, pb, options.params ?? {}, firstTrace, failure, {
+    allowDomains: pb.meta?.allowDomains ?? [],
+    log: (msg) => emit(task, 'log', msg),
+    llmOverrides: ctx.llmOverrides,
+    shouldStop: () => task.stopRequested,
+    // STATE C：沉淀档位非 off → 兜底成功后蒸馏为新版本草稿（.versions/，不动主文件）
+    ...(resolveLearnMode(options) !== 'off'
+      ? { learn: { mainFile: resolve(options.playbookFile ?? ''), runId: task.id } }
+      : {}),
+    onAgentStep: (st) => {
+      emit(task, 'step', slimStep({ ...st, step: ++agentStepBase }));
+      if (st.screenshotBase64) emit(task, 'screenshot', { step: agentStepBase, base64: st.screenshotBase64 });
+    },
+    onRetryStep: (tr) => {
+      emit(task, 'step', slimStep(ctx.toStep(tr, agentStepBase++)));
+    },
+  });
+
+  const aSteps = firstTrace.steps.map((st, i) => slimStep(ctx.toStep(st, i)));
+  const agentSteps = (hybrid.agent?.steps ?? []).map((st) => slimStep({ ...st, step: 0 }));
+  if (hybrid.success) {
+    const retrySteps = hybrid.trace.steps
+      .slice(firstTrace.steps.length + 2) // 跳过首跑 + skipped/agent 标记步
+      .map((st, i) => slimStep(ctx.toStep(st, i)));
+    task.result = {
+      success: true,
+      summary: `Playbook 失败后 Agent 兜底自愈成功（${hybrid.timeline.map((t) => t.phase).join('→')}，Agent ${hybrid.agent?.steps.length ?? 0} 步${hybrid.learnedVersion ? `；已沉淀 v${hybrid.learnedVersion} 草稿` : ''}）`,
+      steps: [...aSteps, ...agentSteps, ...retrySteps],
+      totalMs: Date.now() - ctx.startedAt,
+      llmCalls: hybrid.agent?.llmCalls ?? 0,
+      cost: hybrid.agent?.cost,
+    };
+    task.status = 'done';
+    emit(task, 'done', task.result);
+    writeHistory(task, task.result.steps);
+  } else {
+    task.result = {
+      success: false,
+      summary: hybrid.agent
+        ? `Agent 兜底后仍未恢复：${hybrid.agent.summary}`
+        : `Playbook 执行失败：${failure.message}`,
+      steps: [...aSteps, ...agentSteps],
+      totalMs: Date.now() - ctx.startedAt,
+      llmCalls: hybrid.agent?.llmCalls ?? 0,
+      cost: hybrid.agent?.cost,
+    };
+    task.status = 'error';
+    emit(task, 'error', { message: task.result.summary, result: task.result });
+    writeHistory(task, task.result.steps);
   }
 }
 
@@ -287,7 +493,7 @@ app.get('/api/health', (_req: unknown, res: Response) => {
 });
 
 app.post('/api/tasks', (req: Request, res: Response) => {
-  const { url, task, llm, maxSteps, headed, playbookFile, params, sessionId } = (req.body ?? {}) as TaskOptions;
+  const { url, task, llm, maxSteps, headed, playbookFile, params, sessionId, learn, learnMode, routeMode } = (req.body ?? {}) as TaskOptions;
   if (!task) {
     res.status(400).json({ error: '缺少必填字段：task' });
     return;
@@ -337,7 +543,20 @@ app.post('/api/tasks', (req: Request, res: Response) => {
   const id = randomUUID().slice(0, 8);
   const record: TaskRecord = {
     id,
-    options: { url: effectiveUrl, task: effectiveTask, llm, maxSteps, headed, playbookFile, params, sessionId },
+    options: {
+      url: effectiveUrl,
+      task: effectiveTask,
+      llm,
+      maxSteps,
+      headed,
+      playbookFile,
+      params,
+      sessionId,
+      learn,
+      learnMode,
+      routeMode,
+      originalTask: task,
+    },
     status: 'queued',
     createdAt: Date.now(),
     stopRequested: false,
@@ -357,7 +576,13 @@ app.post('/api/tasks', (req: Request, res: Response) => {
 });
 
 app.post('/api/match', (req: Request, res: Response) => {
-  const { task, url, llm } = (req.body ?? {}) as { task?: string; url?: string; llm?: TaskOptions['llm'] };
+  const { task, url, llm, mode } = (req.body ?? {}) as {
+    task?: string;
+    url?: string;
+    llm?: TaskOptions['llm'];
+    /** intent = 走意图解析层（含参数提取与置信度）；缺省 = 旧的选择器 */
+    mode?: 'deterministic' | 'intent';
+  };
   if (!task || !url) {
     res.status(400).json({ error: '缺少必填字段：url / task' });
     return;
@@ -372,6 +597,20 @@ app.post('/api/match', (req: Request, res: Response) => {
   void (async () => {
     try {
       const dir = join(process.cwd(), 'playbooks');
+      if (mode === 'intent') {
+        const r = await parseIntent(task, url, dir, { llmOverrides: overrides });
+        res.json({
+          matched: r.matched,
+          reason: r.reason,
+          candidateCount: r.candidateCount,
+          confidence: r.confidence,
+          params: r.params,
+          fromCache: r.fromCache,
+          playbook: r.playbookFile ? { name: r.playbookName, file: r.playbookFile } : null,
+          usage: r.usage,
+        });
+        return;
+      }
       const result = await selectPlaybook(task, url, dir, { llmOverrides: overrides });
       res.json({
         matched: Boolean(result.playbook),
